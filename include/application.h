@@ -6,15 +6,15 @@
 
 namespace app {
 
-struct Config {
-    gpio_num_t sensorPin;
-    gpio_num_t ledPin;
-    int64_t blinkIntervalMs;
-    int debounceMs;
-    int loopDelayMs;
-};
+    struct Config {
+        gpio_num_t sensorPin;
+        gpio_num_t ledPin;
+        int64_t blinkIntervalMs;
+        int debounceMs;
+        int loopDelayMs;
+    };
 
-void init(const Config &config);
-void run();
+    void init(const Config &config);
+    void run();
 
 }  // namespace app

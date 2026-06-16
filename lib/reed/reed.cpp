@@ -20,7 +20,7 @@ void init(gpio_num_t pin, bool enablePullup) {
 	gpio_config(&sensor_cfg);
 }
 
-bool isDoorOpen() {
+bool is_door_open() {
 	if (s_pin == GPIO_NUM_NC) {
 		return false;
 	}

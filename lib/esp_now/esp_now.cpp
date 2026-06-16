@@ -7,28 +7,30 @@
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include "nvs_flash.h"
-#include <esp_now.h>
+#include "esp_now.h"
 
 namespace espnow {
 
-static const char *TAG = "espnow";
-static bool s_initialized = false;
-static uint8_t s_channel = 1;
-static ReceiveCallback s_receiveCallback = nullptr;
-static const uint8_t s_broadcastMac[ESP_NOW_ETH_ALEN] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  static const char *TAG = "espnow";
+  static bool s_initialized = false;
+  static uint8_t s_channel = 1;
+  static ReceiveCallback s_receiveCallback = nullptr;
+  static const uint8_t s_broadcastMac[ESP_NOW_ETH_ALEN] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
-static void ensureNvs() {
-  esp_err_t ret = nvs_flash_init();
-  if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-    ESP_ERROR_CHECK(nvs_flash_erase());
-    ret = nvs_flash_init();
-  }
-  if (ret != ESP_OK && ret != ESP_ERR_NVS_NOT_INITIALIZED) {
-    ESP_ERROR_CHECK(ret);
-  }
+  /// @brief Ensure that NVS is initialized, as it's required for Wi-Fi and ESP-NOW.
+  static void ensure_nvs() {
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+      ESP_ERROR_CHECK(nvs_flash_erase());
+      ret = nvs_flash_init();
+    }
+    if (ret != ESP_OK && ret != ESP_ERR_NVS_NOT_INITIALIZED) {
+      ESP_ERROR_CHECK(ret);
+    }
 }
 
-static void ensureWifiStarted(uint8_t channel) {
+/// @brief Ensure that Wi-Fi is started, as it's required for ESP-NOW.
+static void ensure_wifi_started(uint8_t channel) {
   esp_err_t ret = esp_netif_init();
   if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
     ESP_ERROR_CHECK(ret);
@@ -47,7 +49,8 @@ static void ensureWifiStarted(uint8_t channel) {
   ESP_ERROR_CHECK(esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE));
 }
 
-static void ensureBroadcastPeer() {
+/// @brief Ensure that the broadcast peer is added, as it's required for ESP-NOW broadcast.
+static void ensure_broadcast_peer() {
   if (!esp_now_is_peer_exist(s_broadcastMac)) {
     esp_now_peer_info_t peer = {};
     memcpy(peer.peer_addr, s_broadcastMac, ESP_NOW_ETH_ALEN);
@@ -58,12 +61,12 @@ static void ensureBroadcastPeer() {
   }
 }
 
-static void onSend(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {
+static void on_send(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {
   (void)tx_info;
   ESP_LOGI(TAG, "send status=%s", status == ESP_NOW_SEND_SUCCESS ? "ok" : "fail");
 }
 
-static void onRecv(const esp_now_recv_info_t *recvInfo, const uint8_t *data, int len) {
+static void on_recv(const esp_now_recv_info_t *recvInfo, const uint8_t *data, int len) {
   if (recvInfo == nullptr || recvInfo->src_addr == nullptr || data == nullptr || len <= 0) {
     return;
   }
@@ -84,27 +87,28 @@ static void onRecv(const esp_now_recv_info_t *recvInfo, const uint8_t *data, int
   }
 }
 
+
 esp_err_t init(uint8_t channel) {
   if (s_initialized) {
     return ESP_OK;
   }
 
   s_channel = channel;
-  ensureNvs();
-  ensureWifiStarted(channel);
+  ensure_nvs();
+  ensure_wifi_started(channel);
 
   ESP_ERROR_CHECK(esp_now_init());
-  ESP_ERROR_CHECK(esp_now_register_send_cb(onSend));
-  ESP_ERROR_CHECK(esp_now_register_recv_cb(onRecv));
+  ESP_ERROR_CHECK(esp_now_register_send_cb(on_send));
+  ESP_ERROR_CHECK(esp_now_register_recv_cb(on_recv));
 
-  ensureBroadcastPeer();
+  ensure_broadcast_peer();
 
   s_initialized = true;
   ESP_LOGI(TAG, "initialized on channel %u", static_cast<unsigned>(s_channel));
   return ESP_OK;
 }
 
-esp_err_t sendBroadcast(const uint8_t *data, size_t len) {
+esp_err_t send_broadcast(const uint8_t *data, size_t len) {
   if (!s_initialized) {
     return ESP_ERR_INVALID_STATE;
   }
@@ -115,7 +119,7 @@ esp_err_t sendBroadcast(const uint8_t *data, size_t len) {
   return esp_now_send(s_broadcastMac, data, static_cast<int>(len));
 }
 
-esp_err_t sendToPeer(const uint8_t *peerMac, const uint8_t *data, size_t len) {
+esp_err_t send_to_peer(const uint8_t *peerMac, const uint8_t *data, size_t len) {
   if (!s_initialized) {
     return ESP_ERR_INVALID_STATE;
   }
@@ -138,7 +142,7 @@ esp_err_t sendToPeer(const uint8_t *peerMac, const uint8_t *data, size_t len) {
   return esp_now_send(peerMac, data, static_cast<int>(len));
 }
 
-void setReceiveCallback(ReceiveCallback callback) {
+void set_receive_callback(ReceiveCallback callback) {
   s_receiveCallback = callback;
 }
 

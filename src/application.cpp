@@ -13,24 +13,19 @@
 namespace app {
 
 static const char *TAG = "gate_reed";
-static void onEspNowReceive(const uint8_t *fromMac, const uint8_t *data, size_t len) {
+static void on_esp_now_receive(const uint8_t *fromMac, const uint8_t *data, size_t len) {
   (void)fromMac;
   ESP_LOGI(TAG, "ESP-NOW RX: %.*s", static_cast<int>(len), reinterpret_cast<const char *>(data));
 }
 
-static Config s_config = {
-    .sensorPin = GPIO_NUM_NC,
-    .ledPin = GPIO_NUM_NC,
-    .blinkIntervalMs = 300,
-    .debounceMs = 20,
-    .loopDelayMs = 10,
-};
+static Config s_config = {};
+static bool s_initialized = false;
 static bool s_lastDoorOpen = true;
 static int64_t s_lastBlinkTimeMs = 0;
 static int64_t s_lastStatusLogMs = 0;
-static const int64_t kStatusLogIntervalMs = 5000;
+static const int64_t kStatusLogIntervalMs = 10000;
 
-static void printDoorState(bool open) {
+static void print_door_state(bool open) {
   if (open) {
     ESP_LOGI(TAG, "DOOR: OPEN");
   } else {
@@ -38,10 +33,10 @@ static void printDoorState(bool open) {
   }
 }
 
-static void publishDoorState(bool open) {
+static void publish_door_state(bool open) {
   const char *message = open ? "DOOR:OPEN" : "DOOR:CLOSED";
   ESP_LOGI(TAG, "ESP-NOW TX: %s", message);
-  esp_err_t sendRet = espnow::sendBroadcast(
+  esp_err_t sendRet = espnow::send_broadcast(
       reinterpret_cast<const uint8_t *>(message),
       strlen(message));
   if (sendRet != ESP_OK) {
@@ -51,48 +46,54 @@ static void publishDoorState(bool open) {
 
 void init(const Config &config) {
   s_config = config;
+  s_initialized = true;
 
   // Keep global WARN level for smaller firmware, but show INFO for app modules.
   esp_log_level_set(TAG, ESP_LOG_INFO);
   esp_log_level_set("espnow", ESP_LOG_INFO);
 
   ESP_ERROR_CHECK(espnow::init(1));
-  espnow::setReceiveCallback(onEspNowReceive);
+  espnow::set_receive_callback(on_esp_now_receive);
 
   reed::init(s_config.sensorPin, true);
   led::init(s_config.ledPin);
 
   vTaskDelay(pdMS_TO_TICKS(500));
 
-  const bool currentDoorOpen = reed::isDoorOpen();
+  const bool currentDoorOpen = reed::is_door_open();
   s_lastDoorOpen = currentDoorOpen;
 
   ESP_LOGI(TAG, "Boot");
-  printDoorState(currentDoorOpen);
-  publishDoorState(currentDoorOpen);
+  print_door_state(currentDoorOpen);
+  publish_door_state(currentDoorOpen);
   s_lastStatusLogMs = esp_timer_get_time() / 1000;
 
   if (!currentDoorOpen) {
-    led::set(false);
+    led::set_led(false);
   }
 }
 
 void run() {
+  if (!s_initialized) {
+    ESP_LOGE(TAG, "app::init must be called before app::run");
+    return;
+  }
+
   while (true) {
     const int64_t currentMillis = esp_timer_get_time() / 1000;
-    bool currentDoorOpen = reed::isDoorOpen();
+    bool currentDoorOpen = reed::is_door_open();
 
     if (currentDoorOpen != s_lastDoorOpen) {
       vTaskDelay(pdMS_TO_TICKS(s_config.debounceMs));
-      currentDoorOpen = reed::isDoorOpen();
+      currentDoorOpen = reed::is_door_open();
 
       if (currentDoorOpen != s_lastDoorOpen) {
         s_lastDoorOpen = currentDoorOpen;
-        printDoorState(currentDoorOpen);
-        publishDoorState(currentDoorOpen);
+        print_door_state(currentDoorOpen);
+        publish_door_state(currentDoorOpen);
 
         if (!currentDoorOpen) {
-          led::set(false);
+          led::set_led(false);
         }
       }
     }

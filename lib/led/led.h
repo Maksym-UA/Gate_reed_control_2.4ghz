@@ -4,9 +4,9 @@
 
 namespace led {
 
-void init(gpio_num_t pin);
-void set(bool on);
-void toggle();
-bool state();
+    void init(gpio_num_t pin);
+    void set_led(bool on);
+    void toggle();
+    bool state();
 
 }  // namespace led
