@@ -1,12 +1,20 @@
 #pragma once
 
-void application_init();
+#include <stdint.h>
 
-class Application
-{
-public:
-    void start();
+#include "driver/gpio.h"
 
-private:
-    void run();
+namespace app {
+
+struct Config {
+    gpio_num_t sensorPin;
+    gpio_num_t ledPin;
+    int64_t blinkIntervalMs;
+    int debounceMs;
+    int loopDelayMs;
 };
+
+void init(const Config &config);
+void run();
+
+}  // namespace app

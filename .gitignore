@@ -4,7 +4,8 @@
 .vscode/launch.json
 .vscode/ipch
 sdkconfig
-sdkconfig.old
+sdkconfig.*
+!sdkconfig.defaults
 __pycache__/
 *.pyc
 .DS_Store
