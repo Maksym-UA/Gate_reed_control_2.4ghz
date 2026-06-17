@@ -2,7 +2,6 @@
 
 extern "C" void app_main(void) {
   const app::Config config = {
-      .debounceMs = 20,
       .loopDelayMs = 10,
       .pushNotificationIntervalMs = 10000,
   };

@@ -14,7 +14,7 @@
 namespace app {
 
 static const char *TAG = "gate_reed";
-static const int kBootUsbGraceMs = 120000;
+static const int kBootUsbGraceMs = 15000;
 static void on_esp_now_receive(const uint8_t *fromMac, const uint8_t *data, size_t len) {
   (void)fromMac;
   ESP_LOGI(TAG, "ESP-NOW RX: %.*s", static_cast<int>(len), reinterpret_cast<const char *>(data));
