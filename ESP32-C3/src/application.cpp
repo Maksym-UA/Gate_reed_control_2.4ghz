@@ -3,7 +3,7 @@
 #include <string.h>
 
 #include "esp_log.h"
-#include "esp_timer.h"
+#include "esp_sleep.h"
 #include "espnow_service.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -20,10 +20,6 @@ static void on_esp_now_receive(const uint8_t *fromMac, const uint8_t *data, size
 
 static Config s_config = {};
 static bool s_initialized = false;
-static bool s_lastDoorOpen = true;
-static int64_t s_lastBlinkTimeMs = 0;
-static int64_t s_lastStatusLogMs = 0;
-static const int64_t kStatusLogIntervalMs = 10000;
 
 static void print_door_state(bool open) {
   if (open) {
@@ -36,12 +32,23 @@ static void print_door_state(bool open) {
 static void publish_door_state(bool open) {
   const char *message = open ? "DOOR:OPEN" : "DOOR:CLOSED";
   ESP_LOGI(TAG, "ESP-NOW TX: %s", message);
-  esp_err_t sendRet = espnow::send_broadcast(
-      reinterpret_cast<const uint8_t *>(message),
-      strlen(message));
-  if (sendRet != ESP_OK) {
-    ESP_LOGW(TAG, "ESP-NOW send failed: %s", esp_err_to_name(sendRet));
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    esp_err_t sendRet = espnow::send_broadcast(
+        reinterpret_cast<const uint8_t *>(message),
+        strlen(message));
+    if (sendRet == ESP_OK) {
+      return;
+    }
+    ESP_LOGW(TAG, "ESP-NOW send failed (attempt %d): %s", attempt + 1, esp_err_to_name(sendRet));
+    vTaskDelay(pdMS_TO_TICKS(40));
   }
+}
+
+static void enter_deep_sleep_for_next_change(bool currentDoorOpen) {
+  const int wakeLevel = currentDoorOpen ? 0 : 1;
+  ESP_ERROR_CHECK(esp_sleep_enable_ext0_wakeup(s_config.sensorPin, wakeLevel));
+  ESP_LOGI(TAG, "Entering deep sleep; wake when GPIO%d == %d", static_cast<int>(s_config.sensorPin), wakeLevel);
+  esp_deep_sleep_start();
 }
 
 void init(const Config &config) {
@@ -58,15 +65,12 @@ void init(const Config &config) {
   reed::init(s_config.sensorPin, true);
   led::init(s_config.ledPin);
 
-  vTaskDelay(pdMS_TO_TICKS(500));
-
+  vTaskDelay(pdMS_TO_TICKS(s_config.debounceMs));
   const bool currentDoorOpen = reed::is_door_open();
-  s_lastDoorOpen = currentDoorOpen;
 
   ESP_LOGI(TAG, "Boot");
   print_door_state(currentDoorOpen);
   publish_door_state(currentDoorOpen);
-  s_lastStatusLogMs = esp_timer_get_time() / 1000;
 
   if (!currentDoorOpen) {
     led::set_led(false);
@@ -79,39 +83,8 @@ void run() {
     return;
   }
 
-  while (true) {
-    const int64_t currentMillis = esp_timer_get_time() / 1000;
-    bool currentDoorOpen = reed::is_door_open();
-
-    if (currentDoorOpen != s_lastDoorOpen) {
-      vTaskDelay(pdMS_TO_TICKS(s_config.debounceMs));
-      currentDoorOpen = reed::is_door_open();
-
-      if (currentDoorOpen != s_lastDoorOpen) {
-        s_lastDoorOpen = currentDoorOpen;
-        print_door_state(currentDoorOpen);
-        publish_door_state(currentDoorOpen);
-
-        if (!currentDoorOpen) {
-          led::set_led(false);
-        }
-      }
-    }
-
-    if (currentDoorOpen) {
-      if ((currentMillis - s_lastBlinkTimeMs) >= s_config.blinkIntervalMs) {
-        s_lastBlinkTimeMs = currentMillis;
-        led::toggle();
-      }
-    }
-
-    if ((currentMillis - s_lastStatusLogMs) >= kStatusLogIntervalMs) {
-      s_lastStatusLogMs = currentMillis;
-      ESP_LOGI(TAG, "HEARTBEAT: DOOR=%s", currentDoorOpen ? "OPEN" : "CLOSED");
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(s_config.loopDelayMs));
-  }
+  const bool currentDoorOpen = reed::is_door_open();
+  enter_deep_sleep_for_next_change(currentDoorOpen);
 }
 
 }  // namespace app

@@ -19,6 +19,8 @@ static bool s_remoteDoorOpen = false;
 static bool s_remoteDoorStateDirty = false;
 static int64_t s_lastHeartbeatMs = 0;
 static const int64_t kHeartbeatIntervalMs = 10000;
+static int64_t s_lastDoorPacketMs = 0;
+static const int64_t kDoorStateTimeoutMs = 90000;
 
 static void show_remote_door_state_if_needed() {
   if (!s_remoteDoorStateKnown || !s_remoteDoorStateDirty) {
@@ -37,6 +39,7 @@ static void on_esp_now_receive(const uint8_t *fromMac, const uint8_t *data, size
     s_remoteDoorOpen = true;
     s_remoteDoorStateKnown = true;
     s_remoteDoorStateDirty = true;
+    s_lastDoorPacketMs = esp_timer_get_time() / 1000;
     ESP_LOGI(TAG, "ESP-NOW RX: DOOR OPEN");
     return;
   }
@@ -45,6 +48,7 @@ static void on_esp_now_receive(const uint8_t *fromMac, const uint8_t *data, size
     s_remoteDoorOpen = false;
     s_remoteDoorStateKnown = true;
     s_remoteDoorStateDirty = true;
+    s_lastDoorPacketMs = esp_timer_get_time() / 1000;
     ESP_LOGI(TAG, "ESP-NOW RX: DOOR CLOSED");
     return;
   }
@@ -78,6 +82,11 @@ void run() {
     show_remote_door_state_if_needed();
 
     const int64_t currentMillis = esp_timer_get_time() / 1000;
+    if (s_remoteDoorStateKnown && (currentMillis - s_lastDoorPacketMs) >= kDoorStateTimeoutMs) {
+      s_remoteDoorStateKnown = false;
+      ESP_LOGW(TAG, "Door state stale (timeout)");
+    }
+
     if ((currentMillis - s_lastHeartbeatMs) >= kHeartbeatIntervalMs) {
       s_lastHeartbeatMs = currentMillis;
       ESP_LOGI(TAG, "HEARTBEAT: ESP-NOW door=%s", s_remoteDoorStateKnown ? (s_remoteDoorOpen ? "OPEN" : "CLOSED") : "UNKNOWN");
