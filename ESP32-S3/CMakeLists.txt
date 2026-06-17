@@ -1,3 +1,3 @@
 cmake_minimum_required(VERSION 3.16.0)
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
-project(Module_5_PID_regulator)
+project(Gate_reed_control_2.4ghz)

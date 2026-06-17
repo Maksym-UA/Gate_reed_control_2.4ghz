@@ -9,6 +9,7 @@ namespace app {
     struct Config {
         int debounceMs;
         int loopDelayMs;
+        int64_t pushNotificationIntervalMs;
     };
 
     void init(const Config &config);
