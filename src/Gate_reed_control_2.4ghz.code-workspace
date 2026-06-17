@@ -1,7 +1,12 @@
 {
     "folders": [
         {
-            "path": ".."
+            "name": "ESP32-C3",
+            "path": "../ESP32-C3"
+        },
+        {
+            "name": "ESP32-S3",
+            "path": "../ESP32-S3"
         }
     ]
 }

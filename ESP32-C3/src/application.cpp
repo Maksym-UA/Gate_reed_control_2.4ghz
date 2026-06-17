@@ -45,9 +45,14 @@ static void publish_door_state(bool open) {
 }
 
 static void enter_deep_sleep_for_next_change(bool currentDoorOpen) {
-  const int wakeLevel = currentDoorOpen ? 0 : 1;
-  ESP_ERROR_CHECK(esp_sleep_enable_ext0_wakeup(s_config.sensorPin, wakeLevel));
-  ESP_LOGI(TAG, "Entering deep sleep; wake when GPIO%d == %d", static_cast<int>(s_config.sensorPin), wakeLevel);
+  const esp_deepsleep_gpio_wake_up_mode_t wakeMode =
+      currentDoorOpen ? ESP_GPIO_WAKEUP_GPIO_LOW : ESP_GPIO_WAKEUP_GPIO_HIGH;
+  ESP_ERROR_CHECK(esp_deep_sleep_enable_gpio_wakeup((1ULL << s_config.sensorPin), wakeMode));
+  ESP_LOGI(
+      TAG,
+      "Entering deep sleep; wake when GPIO%d goes %s",
+      static_cast<int>(s_config.sensorPin),
+      currentDoorOpen ? "LOW" : "HIGH");
   esp_deep_sleep_start();
 }
 
