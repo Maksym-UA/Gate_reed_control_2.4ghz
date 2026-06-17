@@ -4,6 +4,7 @@
 
 #include "esp_log.h"
 #include "esp_sleep.h"
+#include "esp_timer.h"
 #include "espnow_service.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -13,6 +14,7 @@
 namespace app {
 
 static const char *TAG = "gate_reed";
+static const int kBootUsbGraceMs = 120000;
 static void on_esp_now_receive(const uint8_t *fromMac, const uint8_t *data, size_t len) {
   (void)fromMac;
   ESP_LOGI(TAG, "ESP-NOW RX: %.*s", static_cast<int>(len), reinterpret_cast<const char *>(data));
@@ -20,12 +22,25 @@ static void on_esp_now_receive(const uint8_t *fromMac, const uint8_t *data, size
 
 static Config s_config = {};
 static bool s_initialized = false;
+static esp_sleep_wakeup_cause_t s_wakeCause = ESP_SLEEP_WAKEUP_UNDEFINED;
+
+static void blink_open_feedback();
 
 static void print_door_state(bool open) {
   if (open) {
     ESP_LOGI(TAG, "DOOR: OPEN");
+    blink_open_feedback();
   } else {
     ESP_LOGI(TAG, "DOOR: CLOSED");
+  }
+}
+
+static void blink_open_feedback() {
+  for (int i = 0; i < 3; ++i) {
+    led::set_led(true);
+    vTaskDelay(pdMS_TO_TICKS(80));
+    led::set_led(false);
+    vTaskDelay(pdMS_TO_TICKS(80));
   }
 }
 
@@ -45,20 +60,42 @@ static void publish_door_state(bool open) {
 }
 
 static void enter_deep_sleep_for_next_change(bool currentDoorOpen) {
+  (void)currentDoorOpen;
+
+  // Reconfigure sensor pin right before sleep and sample twice for a stable baseline.
+  const gpio_config_t sensor_cfg = {
+    .pin_bit_mask = (1ULL << s_config.sensorPin),
+    .mode = GPIO_MODE_INPUT,
+    .pull_up_en = GPIO_PULLUP_ENABLE,
+    .pull_down_en = GPIO_PULLDOWN_DISABLE,
+    .intr_type = GPIO_INTR_DISABLE,
+  };
+  ESP_ERROR_CHECK(gpio_config(&sensor_cfg));
+
+  int level = gpio_get_level(s_config.sensorPin);
+  vTaskDelay(pdMS_TO_TICKS(s_config.debounceMs));
+  level = gpio_get_level(s_config.sensorPin);
+
+  const uint64_t wakeMask = (1ULL << s_config.sensorPin);
   const esp_deepsleep_gpio_wake_up_mode_t wakeMode =
-      currentDoorOpen ? ESP_GPIO_WAKEUP_GPIO_LOW : ESP_GPIO_WAKEUP_GPIO_HIGH;
-  ESP_ERROR_CHECK(esp_deep_sleep_enable_gpio_wakeup((1ULL << s_config.sensorPin), wakeMode));
+    level ? ESP_GPIO_WAKEUP_GPIO_LOW : ESP_GPIO_WAKEUP_GPIO_HIGH;
+
+  ESP_ERROR_CHECK(esp_deep_sleep_enable_gpio_wakeup(wakeMask, wakeMode));
   ESP_LOGI(
       TAG,
-      "Entering deep sleep; wake when GPIO%d goes %s",
+    "Entering deep sleep; GPIO%d=%d, wake when it goes %s",
       static_cast<int>(s_config.sensorPin),
-      currentDoorOpen ? "LOW" : "HIGH");
+    level,
+    level ? "LOW" : "HIGH");
   esp_deep_sleep_start();
 }
 
 void init(const Config &config) {
   s_config = config;
   s_initialized = true;
+
+  s_wakeCause = esp_sleep_get_wakeup_cause();
+  ESP_LOGI(TAG, "Wake cause: %d", static_cast<int>(s_wakeCause));
 
   // Keep global WARN level for smaller firmware, but show INFO for app modules.
   esp_log_level_set(TAG, ESP_LOG_INFO);
@@ -76,10 +113,6 @@ void init(const Config &config) {
   ESP_LOGI(TAG, "Boot");
   print_door_state(currentDoorOpen);
   publish_door_state(currentDoorOpen);
-
-  if (!currentDoorOpen) {
-    led::set_led(false);
-  }
 }
 
 void run() {
@@ -88,7 +121,29 @@ void run() {
     return;
   }
 
-  const bool currentDoorOpen = reed::is_door_open();
+  bool currentDoorOpen = reed::is_door_open();
+
+  // After upload/reset, keep USB serial alive for a short time for monitoring/flashing.
+  if (s_wakeCause != ESP_SLEEP_WAKEUP_GPIO) {
+    ESP_LOGI(TAG, "Boot grace %d ms before deep sleep", kBootUsbGraceMs);
+
+    const int64_t graceStartMs = esp_timer_get_time() / 1000;
+    while ((esp_timer_get_time() / 1000 - graceStartMs) < kBootUsbGraceMs) {
+      bool sampledDoorOpen = reed::is_door_open();
+      if (sampledDoorOpen != currentDoorOpen) {
+        vTaskDelay(pdMS_TO_TICKS(s_config.debounceMs));
+        sampledDoorOpen = reed::is_door_open();
+        if (sampledDoorOpen != currentDoorOpen) {
+          currentDoorOpen = sampledDoorOpen;
+          print_door_state(currentDoorOpen);
+          publish_door_state(currentDoorOpen);
+        }
+      }
+
+      vTaskDelay(pdMS_TO_TICKS(s_config.loopDelayMs));
+    }
+  }
+
   enter_deep_sleep_for_next_change(currentDoorOpen);
 }
 
