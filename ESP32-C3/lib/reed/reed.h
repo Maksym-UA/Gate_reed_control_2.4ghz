@@ -4,7 +4,7 @@
 
 namespace reed {
 
-    void init(gpio_num_t pin, bool enablePullup = true);
+    void init(gpio_num_t pin);
     bool is_door_open();
 
 }  // namespace reed

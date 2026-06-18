@@ -139,7 +139,7 @@ void init(const Config &config) {
 
   ESP_ERROR_CHECK(espnow::init(1));
 
-  reed::init(s_config.sensorPin, true);
+  reed::init(s_config.sensorPin);
   led::init(s_config.ledPin);
 
   vTaskDelay(pdMS_TO_TICKS(s_config.debounceMs));

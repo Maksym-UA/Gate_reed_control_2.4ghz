@@ -6,13 +6,13 @@ namespace reed {
 
 static gpio_num_t s_pin = GPIO_NUM_NC;
 
-void init(gpio_num_t pin, bool enablePullup) {
+void init(gpio_num_t pin) {
 	s_pin = pin;
 
 	const gpio_config_t sensor_cfg = {
 			.pin_bit_mask = (1ULL << pin),
 			.mode = GPIO_MODE_INPUT,
-			.pull_up_en = enablePullup ? GPIO_PULLUP_ENABLE : GPIO_PULLUP_DISABLE,
+			.pull_up_en = GPIO_PULLUP_DISABLE,
 			.pull_down_en = GPIO_PULLDOWN_DISABLE,
 			.intr_type = GPIO_INTR_DISABLE,
 	};
