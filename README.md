@@ -18,6 +18,11 @@ Each firmware keeps `src/main.cpp` minimal and places runtime logic in `src/appl
 | ESP32-C3 (Seeed XIAO ESP32C3) | Reed sensor reader + ESP-NOW TX + deep sleep | Reed: GPIO4, LED: GPIO20 |
 | ESP32-S3 (ESP32-S3-DevKitC-1) | ESP-NOW RX + state monitoring | No required sensor GPIO in current receiver build |
 
+### Wiring Notes
+
+- Use an external 100k pull-up resistor on ESP32-C3 GPIO4 for the reed input line for more efficient power management.
+- Add an MTS-101 switch on the TP4056 Type-C battery path so battery power can be disconnected while the ESP32-C3 is powered from USB.
+
 ## Communication Model
 
 ESP32-C3 publishes gate state messages:
@@ -55,7 +60,8 @@ ESP32-C3:
 2. Reads current door state and transmits initial state.
 3. Blinks LED 3 times when state is OPEN.
 4. Waits in boot grace window to allow monitoring/flashing.
-5. Enters deep sleep and wakes on reed pin level change.
+5. On wake from GPIO/timer, stays active briefly to catch quick follow-up transitions.
+6. Enters deep sleep, wakes on reed pin level change, and also uses a timer fallback wake.
 
 ESP32-S3:
 
@@ -64,6 +70,7 @@ ESP32-S3:
 3. Tracks known/unknown remote door state.
 4. Logs periodic heartbeat with current state.
 5. Marks door state stale after timeout without packets.
+6. Emits periodic push notification logs while door remains OPEN.
 
 ## Project Structure
 
@@ -92,8 +99,11 @@ ESP32-S3/
   CMakeLists.txt
   platformio.ini
 
+Gate_reed_control_2.4ghz.code-workspace
 .gitignore
 README.md
+src/
+
 ```
 
 ## Notes
