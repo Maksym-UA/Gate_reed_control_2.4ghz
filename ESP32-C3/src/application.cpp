@@ -15,9 +15,8 @@ namespace app {
 
 static const char *TAG = "gate_reed";
 static const int kBootUsbGraceMs = 15000;
-static const int kStateConfirmMs = 250;
 static const int64_t kSafetyWakeupIntervalMs = 15000;
-static const int kPostWakeActiveMs = 3000;
+static const int kPostWakeActiveMs = 2000;
 
 static const char *wakeup_cause_to_string(esp_sleep_wakeup_cause_t cause) {
   switch (cause) {
@@ -42,41 +41,11 @@ static const char *wakeup_cause_to_string(esp_sleep_wakeup_cause_t cause) {
   }
 }
 
-static void on_esp_now_receive(const uint8_t *fromMac, const uint8_t *data, size_t len) {
-  (void)fromMac;
-  ESP_LOGI(TAG, "ESP-NOW RX: %.*s", static_cast<int>(len), reinterpret_cast<const char *>(data));
-}
-
 static Config s_config = {};
 static bool s_initialized = false;
 static esp_sleep_wakeup_cause_t s_wakeCause = ESP_SLEEP_WAKEUP_UNDEFINED;
 
 static void blink_open_feedback();
-
-static bool confirm_state_stable(bool expectedOpen, int confirmMs) {
-  const int64_t startMs = esp_timer_get_time() / 1000;
-  while ((esp_timer_get_time() / 1000 - startMs) < confirmMs) {
-    if (reed::is_door_open() != expectedOpen) {
-      return false;
-    }
-    vTaskDelay(pdMS_TO_TICKS(s_config.loopDelayMs));
-  }
-  return true;
-}
-
-static bool read_stable_door_state() {
-  bool sampled = reed::is_door_open();
-  vTaskDelay(pdMS_TO_TICKS(s_config.debounceMs));
-  sampled = reed::is_door_open();
-
-  if (!confirm_state_stable(sampled, kStateConfirmMs)) {
-    // If unstable, resample once and trust the new stable candidate.
-    sampled = reed::is_door_open();
-    vTaskDelay(pdMS_TO_TICKS(s_config.debounceMs));
-    sampled = reed::is_door_open();
-  }
-  return sampled;
-}
 
 static void print_door_state(bool open) {
   if (open) {
@@ -99,6 +68,7 @@ static void blink_open_feedback() {
 static void publish_door_state(bool open) {
   const char *message = open ? "DOOR:OPEN" : "DOOR:CLOSED";
   ESP_LOGI(TAG, "ESP-NOW TX: %s", message);
+
   for (int attempt = 0; attempt < 3; ++attempt) {
     esp_err_t sendRet = espnow::send_broadcast(
         reinterpret_cast<const uint8_t *>(message),
@@ -106,21 +76,20 @@ static void publish_door_state(bool open) {
     if (sendRet == ESP_OK) {
       return;
     }
-    ESP_LOGW(TAG, "ESP-NOW send failed (attempt %d): %s", attempt + 1, esp_err_to_name(sendRet));
+
+    ESP_LOGW(TAG, "ESP-NOW send failed (attempt %d): %s",
+             attempt + 1, esp_err_to_name(sendRet));
     vTaskDelay(pdMS_TO_TICKS(40));
   }
 }
 
-static void enter_deep_sleep_for_next_change(bool currentDoorOpen) {
-  (void)currentDoorOpen;
-
-  // Reconfigure sensor pin right before sleep and sample twice for a stable baseline.
+static void enter_deep_sleep_for_next_change() {
   const gpio_config_t sensor_cfg = {
-    .pin_bit_mask = (1ULL << s_config.sensorPin),
-    .mode = GPIO_MODE_INPUT,
-    .pull_up_en = GPIO_PULLUP_ENABLE,
-    .pull_down_en = GPIO_PULLDOWN_DISABLE,
-    .intr_type = GPIO_INTR_DISABLE,
+      .pin_bit_mask = (1ULL << s_config.sensorPin),
+      .mode = GPIO_MODE_INPUT,
+      .pull_up_en = GPIO_PULLUP_ENABLE,
+      .pull_down_en = GPIO_PULLDOWN_DISABLE,
+      .intr_type = GPIO_INTR_DISABLE,
   };
   ESP_ERROR_CHECK(gpio_config(&sensor_cfg));
 
@@ -132,11 +101,11 @@ static void enter_deep_sleep_for_next_change(bool currentDoorOpen) {
   const bool wakePinValid = esp_sleep_is_valid_wakeup_gpio(s_config.sensorPin);
   if (wakePinValid) {
     const esp_deepsleep_gpio_wake_up_mode_t wakeMode =
-      level ? ESP_GPIO_WAKEUP_GPIO_LOW : ESP_GPIO_WAKEUP_GPIO_HIGH;
+        level ? ESP_GPIO_WAKEUP_GPIO_LOW : ESP_GPIO_WAKEUP_GPIO_HIGH;
     ESP_ERROR_CHECK(esp_deep_sleep_enable_gpio_wakeup(wakeMask, wakeMode));
   } else {
     ESP_LOGW(TAG,
-             "GPIO%d is not valid for deep sleep wakeup; using timer fallback only",
+             "GPIO%d is not valid for deep sleep wakeup; timer fallback only",
              static_cast<int>(s_config.sensorPin));
   }
 
@@ -147,6 +116,7 @@ static void enter_deep_sleep_for_next_change(bool currentDoorOpen) {
            level,
            wakePinValid ? "yes" : "no",
            kSafetyWakeupIntervalMs);
+
   esp_deep_sleep_start();
 }
 
@@ -164,17 +134,16 @@ void init(const Config &config) {
            static_cast<int>(s_config.sensorPin),
            esp_sleep_is_valid_wakeup_gpio(s_config.sensorPin) ? "yes" : "no");
 
-  // Keep global WARN level for smaller firmware, but show INFO for app modules.
   esp_log_level_set(TAG, ESP_LOG_INFO);
   esp_log_level_set("espnow", ESP_LOG_INFO);
 
   ESP_ERROR_CHECK(espnow::init(1));
-  espnow::set_receive_callback(on_esp_now_receive);
 
   reed::init(s_config.sensorPin, true);
   led::init(s_config.ledPin);
 
-  const bool currentDoorOpen = read_stable_door_state();
+  vTaskDelay(pdMS_TO_TICKS(s_config.debounceMs));
+  const bool currentDoorOpen = reed::is_door_open();
 
   ESP_LOGI(TAG, "Boot");
   print_door_state(currentDoorOpen);
@@ -187,9 +156,8 @@ void run() {
     return;
   }
 
-  bool currentDoorOpen = read_stable_door_state();
+  bool currentDoorOpen = reed::is_door_open();
 
-  // After upload/reset, keep USB serial alive for a short time for monitoring/flashing.
   if (s_wakeCause != ESP_SLEEP_WAKEUP_GPIO && s_wakeCause != ESP_SLEEP_WAKEUP_TIMER) {
     ESP_LOGI(TAG, "Boot grace %d ms before deep sleep", kBootUsbGraceMs);
 
@@ -197,7 +165,9 @@ void run() {
     while ((esp_timer_get_time() / 1000 - graceStartMs) < kBootUsbGraceMs) {
       bool sampledDoorOpen = reed::is_door_open();
       if (sampledDoorOpen != currentDoorOpen) {
-        if (confirm_state_stable(sampledDoorOpen, kStateConfirmMs)) {
+        vTaskDelay(pdMS_TO_TICKS(s_config.debounceMs));
+        sampledDoorOpen = reed::is_door_open();
+        if (sampledDoorOpen != currentDoorOpen) {
           currentDoorOpen = sampledDoorOpen;
           print_door_state(currentDoorOpen);
           publish_door_state(currentDoorOpen);
@@ -216,7 +186,9 @@ void run() {
     while ((esp_timer_get_time() / 1000 - activeStartMs) < kPostWakeActiveMs) {
       bool sampledDoorOpen = reed::is_door_open();
       if (sampledDoorOpen != currentDoorOpen) {
-        if (confirm_state_stable(sampledDoorOpen, kStateConfirmMs)) {
+        vTaskDelay(pdMS_TO_TICKS(s_config.debounceMs));
+        sampledDoorOpen = reed::is_door_open();
+        if (sampledDoorOpen != currentDoorOpen) {
           currentDoorOpen = sampledDoorOpen;
           print_door_state(currentDoorOpen);
           publish_door_state(currentDoorOpen);
@@ -227,7 +199,7 @@ void run() {
     }
   }
 
-  enter_deep_sleep_for_next_change(currentDoorOpen);
+  enter_deep_sleep_for_next_change();
 }
 
 }  // namespace app

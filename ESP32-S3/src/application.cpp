@@ -21,6 +21,7 @@ namespace app {
   static int64_t s_lastHeartbeatMs = 0;
   static const int64_t kHeartbeatIntervalMs = 10000;
   static int64_t s_lastPushNotificationMs = 0;
+  static int64_t s_doorOpenSinceMs = 0;
   static int64_t s_lastDoorPacketMs = 0;
   static const int64_t kDoorStateTimeoutMs = 90000;
 
@@ -32,10 +33,16 @@ namespace app {
     if (len == 9 && memcmp(data, "DOOR:OPEN", 9) == 0) {
       const int64_t nowMs = esp_timer_get_time() / 1000;
       taskENTER_CRITICAL(&s_stateMux);
+      bool wasAlreadyOpen = s_remoteDoorOpen;
       s_remoteDoorOpen = true;
       s_remoteDoorStateKnown = true;
+      // Always update lastDoorPacketMs to keep timeout window fresh
       s_lastDoorPacketMs = nowMs;
-      s_lastPushNotificationMs = nowMs;
+      // Only reset open-duration baseline and push timer on state transition.
+      if (!wasAlreadyOpen) {
+        s_doorOpenSinceMs = nowMs;
+        s_lastPushNotificationMs = nowMs;
+      }
       taskEXIT_CRITICAL(&s_stateMux);
       ESP_LOGI(TAG, "ESP-NOW RX: DOOR OPEN");
       return;
@@ -47,6 +54,7 @@ namespace app {
       s_remoteDoorOpen = false;
       s_remoteDoorStateKnown = true;
       s_lastDoorPacketMs = nowMs;
+      s_doorOpenSinceMs = 0;
       taskEXIT_CRITICAL(&s_stateMux);
       ESP_LOGI(TAG, "ESP-NOW RX: DOOR CLOSED");
       return;
@@ -82,12 +90,14 @@ namespace app {
       bool remoteDoorStateKnown = false;
       bool remoteDoorOpen = false;
       int64_t lastDoorPacketMs = 0;
+      int64_t doorOpenSinceMs = 0;
       int64_t lastPushNotificationMs = 0;
 
       taskENTER_CRITICAL(&s_stateMux);
       remoteDoorStateKnown = s_remoteDoorStateKnown;
       remoteDoorOpen = s_remoteDoorOpen;
       lastDoorPacketMs = s_lastDoorPacketMs;
+      doorOpenSinceMs = s_doorOpenSinceMs;
       lastPushNotificationMs = s_lastPushNotificationMs;
       taskEXIT_CRITICAL(&s_stateMux);
 
@@ -95,6 +105,7 @@ namespace app {
         taskENTER_CRITICAL(&s_stateMux);
         s_remoteDoorStateKnown = false;
         s_remoteDoorOpen = false;
+        s_doorOpenSinceMs = 0;
         taskEXIT_CRITICAL(&s_stateMux);
         ESP_LOGW(TAG, "Door state stale (timeout)");
         remoteDoorStateKnown = false;
@@ -112,7 +123,7 @@ namespace app {
         s_lastPushNotificationMs = currentMillis;
         taskEXIT_CRITICAL(&s_stateMux);
 
-        s_doorOpenStateDurationMs = currentMillis - lastDoorPacketMs;
+        s_doorOpenStateDurationMs = currentMillis - doorOpenSinceMs;
         const int64_t doorOpenMinutes = s_doorOpenStateDurationMs / 60000;
         const int64_t doorOpenSeconds = (s_doorOpenStateDurationMs % 60000) / 1000;
         ESP_LOGI(TAG, "PUSH NOTIFICATION: ESP-NOW door is open for %lldm %llds. Close the door!", doorOpenMinutes, doorOpenSeconds);
