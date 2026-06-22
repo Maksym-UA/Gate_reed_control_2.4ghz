@@ -4,7 +4,7 @@
 
 Dual-board ESP32 project for gate door-state telemetry over ESP-NOW.
 
-- ESP32-C3 acts as the transmitter
+- Xiao ESP32-C3 acts as the transmitter
 - ESP32-S3 acts as the receiver
 - Framework: ESP-IDF via PlatformIO
 - Transport: ESP-NOW (2.4GHz)
@@ -111,6 +111,7 @@ src/
 - ESP-NOW is connectionless and best-effort; RF environment affects reliability.
 - Deep sleep on ESP32-C3 may make USB serial disappear until the next wake/reset.
 - If VS Code shows stale Problems after successful builds, run a clean build and reload the window.
+- KiCAd Xiao ESP32-C3 footprint from https://github.com/VectorSpaceHQ/XIAO_ESP32C3
 
 ## Contact
 

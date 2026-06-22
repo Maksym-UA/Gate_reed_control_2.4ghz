@@ -2,6 +2,7 @@
 
 #include <string.h>
 
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
 #include "esp_timer.h"
@@ -15,7 +16,7 @@ namespace app {
 
 static const char *TAG = "gate_reed";
 static const int kBootUsbGraceMs = 15000;
-static const int64_t kSafetyWakeupIntervalMs = 15000;
+static const int64_t kSafetyWakeupIntervalMs = 3000;
 static const int kPostWakeActiveMs = 2000;
 
 static const char *wakeup_cause_to_string(esp_sleep_wakeup_cause_t cause) {
@@ -44,6 +45,8 @@ static const char *wakeup_cause_to_string(esp_sleep_wakeup_cause_t cause) {
 static Config s_config = {};
 static bool s_initialized = false;
 static esp_sleep_wakeup_cause_t s_wakeCause = ESP_SLEEP_WAKEUP_UNDEFINED;
+RTC_DATA_ATTR static bool s_lastPublishedDoorOpen = false;
+RTC_DATA_ATTR static bool s_lastPublishedDoorOpenValid = false;
 
 static void blink_open_feedback();
 
@@ -65,7 +68,7 @@ static void blink_open_feedback() {
   }
 }
 
-static void publish_door_state(bool open) {
+static bool publish_door_state(bool open) {
   const char *message = open ? "DOOR:OPEN" : "DOOR:CLOSED";
   ESP_LOGI(TAG, "ESP-NOW TX: %s", message);
 
@@ -74,13 +77,18 @@ static void publish_door_state(bool open) {
         reinterpret_cast<const uint8_t *>(message),
         strlen(message));
     if (sendRet == ESP_OK) {
-      return;
+      s_lastPublishedDoorOpen = open;
+      s_lastPublishedDoorOpenValid = true;
+      return true;
     }
 
     ESP_LOGW(TAG, "ESP-NOW send failed (attempt %d): %s",
              attempt + 1, esp_err_to_name(sendRet));
     vTaskDelay(pdMS_TO_TICKS(40));
   }
+
+  ESP_LOGW(TAG, "ESP-NOW TX dropped after retries: %s", message);
+  return false;
 }
 
 static void enter_deep_sleep_for_next_change() {
@@ -109,12 +117,15 @@ static void enter_deep_sleep_for_next_change() {
              static_cast<int>(s_config.sensorPin));
   }
 
-  ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(kSafetyWakeupIntervalMs * 1000));
+  if (!wakePinValid) {
+    ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(kSafetyWakeupIntervalMs * 1000));
+  }
   ESP_LOGI(TAG,
-           "Entering deep sleep; GPIO%d=%d, gpioWakeValid=%s, timer fallback: %lld ms",
+           "Entering deep sleep; GPIO%d=%d, gpioWakeValid=%s, timer fallback: %s%lld ms",
            static_cast<int>(s_config.sensorPin),
            level,
            wakePinValid ? "yes" : "no",
+           wakePinValid ? "off/" : "on/",
            kSafetyWakeupIntervalMs);
 
   esp_deep_sleep_start();
@@ -147,7 +158,16 @@ void init(const Config &config) {
 
   ESP_LOGI(TAG, "Boot");
   print_door_state(currentDoorOpen);
-  publish_door_state(currentDoorOpen);
+  const bool wakeFromSleep =
+      (s_wakeCause == ESP_SLEEP_WAKEUP_GPIO || s_wakeCause == ESP_SLEEP_WAKEUP_TIMER);
+  const bool stateChangedSinceLastPublish =
+      (!s_lastPublishedDoorOpenValid || s_lastPublishedDoorOpen != currentDoorOpen);
+
+  if (!wakeFromSleep || stateChangedSinceLastPublish) {
+    publish_door_state(currentDoorOpen);
+  } else {
+    ESP_LOGI(TAG, "Skipping boot TX (unchanged from last published state)");
+  }
 }
 
 void run() {
