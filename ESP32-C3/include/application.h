@@ -9,6 +9,7 @@ namespace app {
 struct Config {
     gpio_num_t sensorPin;
     gpio_num_t ledPin;
+    gpio_num_t voltagePin;
     int debounceMs;
     int loopDelayMs;
 };

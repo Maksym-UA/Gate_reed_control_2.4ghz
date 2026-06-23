@@ -2,22 +2,29 @@
 
 #include <string.h>
 
+#include "driver/gpio.h"
 #include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
 #include "esp_timer.h"
 #include "espnow_service.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
 #include "freertos/task.h"
 #include "led.h"
 #include "reed.h"
+#include "voltage.h"
 
 namespace app {
 
 static const char *TAG = "gate_reed";
 static const int kBootUsbGraceMs = 15000;
-static const int64_t kSafetyWakeupIntervalMs = 3000;
-static const int kPostWakeActiveMs = 2000;
+static const int64_t kFallbackWakeupIntervalMs = 3000;
+static const int64_t kOpenStateWakeupIntervalMs = 5000;
+static const int64_t kKeepAliveWakeupIntervalMs = 10000;
+static const int64_t kPeriodicKeepAliveMs = 20000;
+static const int kPostWakeActiveMs = 3500;
+static const int64_t kBatteryTxIntervalMs = 10000;
 
 static const char *wakeup_cause_to_string(esp_sleep_wakeup_cause_t cause) {
   switch (cause) {
@@ -47,30 +54,85 @@ static bool s_initialized = false;
 static esp_sleep_wakeup_cause_t s_wakeCause = ESP_SLEEP_WAKEUP_UNDEFINED;
 RTC_DATA_ATTR static bool s_lastPublishedDoorOpen = false;
 RTC_DATA_ATTR static bool s_lastPublishedDoorOpenValid = false;
+RTC_DATA_ATTR static uint32_t s_unchangedTimerWakeCount = 0;
+RTC_DATA_ATTR static uint32_t s_batteryTxWakeCount = 0;
 
-static void blink_open_feedback();
+// LED blink command posted to s_ledQueue by the main task.
+struct LedCmd {
+  int count;
+  int on_ms;
+  int off_ms;
+};
+
+static QueueHandle_t      s_ledQueue      = nullptr;
+static EventGroupHandle_t s_ledEvents     = nullptr;
+static TaskHandle_t       s_ledTaskHandle = nullptr;
+static const EventBits_t  kLedIdleBit     = BIT0;
+static const EventBits_t  kVoltIdleBit    = BIT1;
+static const EventBits_t  kAllIdleBits    = BIT0 | BIT1;
+
+static void blink_state_feedback(bool open);
+static void led_task(void *arg);
+static void voltage_task(void *arg);
 
 static void print_door_state(bool open) {
   if (open) {
     ESP_LOGI(TAG, "DOOR: OPEN");
-    blink_open_feedback();
   } else {
     ESP_LOGI(TAG, "DOOR: CLOSED");
   }
 }
 
-static void blink_open_feedback() {
-  for (int i = 0; i < 3; ++i) {
-    led::set_led(true);
-    vTaskDelay(pdMS_TO_TICKS(80));
+// Posts a blink command to the LED task queue (non-blocking).
+// The LED task executes the sequence at priority 3 so the main sensor
+// loop (priority 5) keeps polling the reed switch during blink delays.
+static void blink_state_feedback(bool open) {
+  if (s_ledQueue == nullptr) return;
+  const LedCmd cmd = open ? LedCmd{3, 80, 80} : LedCmd{1, 250, 0};
+  xQueueSend(s_ledQueue, &cmd, pdMS_TO_TICKS(200));
+}
+
+// Low-priority LED task: drives GPIO based on commands from s_ledQueue.
+// Signals idle via kLedIdleBit so enter_deep_sleep_for_next_change() can
+// wait for any in-progress blink to finish before sleeping.
+static void led_task(void *) {
+  while (true) {
+    LedCmd cmd;
+    xQueueReceive(s_ledQueue, &cmd, portMAX_DELAY);
+    xEventGroupClearBits(s_ledEvents, kLedIdleBit);  // busy
+    for (int i = 0; i < cmd.count; ++i) {
+      led::set_led(true);
+      vTaskDelay(pdMS_TO_TICKS(cmd.on_ms));
+      led::set_led(false);
+      if (cmd.off_ms > 0) vTaskDelay(pdMS_TO_TICKS(cmd.off_ms));
+    }
     led::set_led(false);
-    vTaskDelay(pdMS_TO_TICKS(80));
+    vTaskDelay(pdMS_TO_TICKS(50));
+    xEventGroupSetBits(s_ledEvents, kLedIdleBit);    // idle
   }
 }
 
-static bool publish_door_state(bool open) {
+// One-shot battery voltage task: reads ADC, broadcasts BATT message, then waits
+// for ESP-NOW TX to complete (send_broadcast is async) before signalling idle
+// and self-deleting. Runs at priority 2.
+static void voltage_task(void *) {
+  const float v = voltage::read_voltage();
+  char msg[16];
+  snprintf(msg, sizeof(msg), "BATT:%.2fV", v);
+  ESP_LOGI(TAG, "Battery voltage: %.2fV", v);
+  espnow::send_broadcast(reinterpret_cast<const uint8_t *>(msg), strlen(msg));
+  // esp_now_send() is async; wait for the WiFi driver to complete the TX
+  // before signalling idle, otherwise deep sleep kills the packet in flight.
+  vTaskDelay(pdMS_TO_TICKS(200));
+  if (s_ledEvents != nullptr) {
+    xEventGroupSetBits(s_ledEvents, kVoltIdleBit);
+  }
+  vTaskDelete(nullptr);
+}
+
+static bool publish_door_state(bool open, const char *txKind) {
   const char *message = open ? "DOOR:OPEN" : "DOOR:CLOSED";
-  ESP_LOGI(TAG, "ESP-NOW TX: %s", message);
+  ESP_LOGI(TAG, "ESP-NOW TX [%s]: %s", txKind, message);
 
   for (int attempt = 0; attempt < 3; ++attempt) {
     esp_err_t sendRet = espnow::send_broadcast(
@@ -87,11 +149,11 @@ static bool publish_door_state(bool open) {
     vTaskDelay(pdMS_TO_TICKS(40));
   }
 
-  ESP_LOGW(TAG, "ESP-NOW TX dropped after retries: %s", message);
+  ESP_LOGW(TAG, "ESP-NOW TX [%s] dropped after retries: %s", txKind, message);
   return false;
 }
 
-static void enter_deep_sleep_for_next_change() {
+static void enter_deep_sleep_for_next_change(bool currentDoorOpen) {
   const gpio_config_t sensor_cfg = {
       .pin_bit_mask = (1ULL << s_config.sensorPin),
       .mode = GPIO_MODE_INPUT,
@@ -117,16 +179,46 @@ static void enter_deep_sleep_for_next_change() {
              static_cast<int>(s_config.sensorPin));
   }
 
-  if (!wakePinValid) {
-    ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(kSafetyWakeupIntervalMs * 1000));
+  // Use the debounced logical state from the run loop for timer policy.
+  // A single raw sample taken right before sleep can be biased by wiring/leakage.
+  const bool doorOpenNow = currentDoorOpen;
+  const int64_t timerWakeupIntervalMs = !wakePinValid
+      ? kFallbackWakeupIntervalMs
+      : (doorOpenNow ? kOpenStateWakeupIntervalMs : kKeepAliveWakeupIntervalMs);
+  ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(timerWakeupIntervalMs * 1000));
+
+  // Hold LED pin LOW across deep sleep so GPIO20 never floats during wake-up,
+  // eliminating the ghost dim blink caused by a floating pin before led::init() runs.
+  led::set_led(false);
+  // Wait for both the LED blink and voltage TX to complete before sleeping.
+  // Voltage task adds 200ms post-send delay to ensure the radio TX finishes.
+  // Total timeout 1.5s covers the worst case (blink ~580ms + volt TX ~200ms).
+  if (s_ledEvents != nullptr) {
+    xEventGroupWaitBits(s_ledEvents, kAllIdleBits,
+                        pdFALSE, pdTRUE, pdMS_TO_TICKS(1500));
   }
+  // Clean up FreeRTOS objects; they are recreated after the next wake.
+  if (s_ledTaskHandle != nullptr) {
+    vTaskDelete(s_ledTaskHandle);
+    s_ledTaskHandle = nullptr;
+  }
+  if (s_ledQueue != nullptr) {
+    vQueueDelete(s_ledQueue);
+    s_ledQueue = nullptr;
+  }
+  if (s_ledEvents != nullptr) {
+    vEventGroupDelete(s_ledEvents);
+    s_ledEvents = nullptr;
+  }
+  gpio_hold_en(s_config.ledPin);
+
   ESP_LOGI(TAG,
-           "Entering deep sleep; GPIO%d=%d, gpioWakeValid=%s, timer fallback: %s%lld ms",
+           "Entering deep sleep; GPIO%d=%d, doorOpen=%s, gpioWakeValid=%s, timer wake: %lld ms",
            static_cast<int>(s_config.sensorPin),
            level,
+           doorOpenNow ? "yes" : "no",
            wakePinValid ? "yes" : "no",
-           wakePinValid ? "off/" : "on/",
-           kSafetyWakeupIntervalMs);
+           timerWakeupIntervalMs);
 
   esp_deep_sleep_start();
 }
@@ -148,10 +240,27 @@ void init(const Config &config) {
   esp_log_level_set(TAG, ESP_LOG_INFO);
   esp_log_level_set("espnow", ESP_LOG_INFO);
 
+  // Boost this task's priority above the LED (3) and voltage (2) tasks so the
+  // sensor polling loop always preempts them on single-core ESP32-C3.
+  vTaskPrioritySet(nullptr, 5);
+
+  // Release GPIO hold set before previous deep sleep (hold keeps LED LOW while chip
+  // is asleep and during the early boot phase, preventing the ghost dim blink).
+  gpio_hold_dis(s_config.ledPin);
+  led::init(s_config.ledPin);
+
+  // Create LED queue and event group; start both bits idle so the pre-sleep
+  // wait passes immediately when no blink or voltage TX is pending.
+  s_ledQueue  = xQueueCreate(4, sizeof(LedCmd));
+  s_ledEvents = xEventGroupCreate();
+  xEventGroupSetBits(s_ledEvents, kAllIdleBits);
+  xTaskCreate(led_task, "led_task", 2048, nullptr, 3, &s_ledTaskHandle);
+
+  voltage::init(s_config.voltagePin);
+
   ESP_ERROR_CHECK(espnow::init(1));
 
   reed::init(s_config.sensorPin);
-  led::init(s_config.ledPin);
 
   vTaskDelay(pdMS_TO_TICKS(s_config.debounceMs));
   const bool currentDoorOpen = reed::is_door_open();
@@ -162,11 +271,61 @@ void init(const Config &config) {
       (s_wakeCause == ESP_SLEEP_WAKEUP_GPIO || s_wakeCause == ESP_SLEEP_WAKEUP_TIMER);
   const bool stateChangedSinceLastPublish =
       (!s_lastPublishedDoorOpenValid || s_lastPublishedDoorOpen != currentDoorOpen);
+  const bool isTimerWake = (s_wakeCause == ESP_SLEEP_WAKEUP_TIMER);
 
-  if (!wakeFromSleep || stateChangedSinceLastPublish) {
-    publish_door_state(currentDoorOpen);
+  bool shouldPublish = !wakeFromSleep || stateChangedSinceLastPublish;
+  if (isTimerWake && !stateChangedSinceLastPublish) {
+    const int64_t currentTimerWakeIntervalMs =
+        currentDoorOpen ? kOpenStateWakeupIntervalMs : kKeepAliveWakeupIntervalMs;
+    const uint32_t keepAliveWakeThreshold =
+        static_cast<uint32_t>((kPeriodicKeepAliveMs + currentTimerWakeIntervalMs - 1) /
+                              currentTimerWakeIntervalMs);
+    ++s_unchangedTimerWakeCount;
+    shouldPublish = (s_unchangedTimerWakeCount >= keepAliveWakeThreshold);
+  }
+
+  if (shouldPublish) {
+    const char *txKind = "CHANGE";
+    if (!wakeFromSleep && !s_lastPublishedDoorOpenValid) {
+      txKind = "BOOT";
+    } else if (isTimerWake && !stateChangedSinceLastPublish) {
+      txKind = "KEEPALIVE";
+    }
+
+    // Blink on genuine state changes detected at wake (before the run() loop starts).
+    // Without this, only the ghost dim blink would be visible for between-sleep transitions.
+    if (wakeFromSleep && stateChangedSinceLastPublish) {
+      blink_state_feedback(currentDoorOpen);
+    }
+
+    const bool published = publish_door_state(currentDoorOpen, txKind);
+    if (published) {
+      s_unchangedTimerWakeCount = 0;
+    }
   } else {
-    ESP_LOGI(TAG, "Skipping boot TX (unchanged from last published state)");
+    ESP_LOGI(TAG, "Skipping boot TX (unchanged timer wake, keepalive not due)");
+  }
+
+  // Battery TX: spawn a low-priority (2) one-shot task to read and broadcast
+  // voltage every ~kBatteryTxIntervalMs. The task runs without blocking the
+  // main sensor loop or LED feedback.
+  if (isTimerWake) {
+    const int64_t timerIntervalMs =
+        esp_sleep_is_valid_wakeup_gpio(s_config.sensorPin)
+            ? (currentDoorOpen ? kOpenStateWakeupIntervalMs : kKeepAliveWakeupIntervalMs)
+            : kFallbackWakeupIntervalMs;
+    const uint32_t batteryThreshold = static_cast<uint32_t>(
+        (kBatteryTxIntervalMs + timerIntervalMs - 1) / timerIntervalMs);
+    ++s_batteryTxWakeCount;
+    if (s_batteryTxWakeCount >= batteryThreshold) {
+      s_batteryTxWakeCount = 0;  // Reset before spawning; RTC is clean before sleep
+      // Clear volt idle bit BEFORE spawning so the pre-sleep wait always sees
+      // the task as pending if it was created.
+      if (s_ledEvents != nullptr) {
+        xEventGroupClearBits(s_ledEvents, kVoltIdleBit);
+      }
+      xTaskCreate(voltage_task, "volt_task", 2048, nullptr, 2, nullptr);
+    }
   }
 }
 
@@ -190,7 +349,8 @@ void run() {
         if (sampledDoorOpen != currentDoorOpen) {
           currentDoorOpen = sampledDoorOpen;
           print_door_state(currentDoorOpen);
-          publish_door_state(currentDoorOpen);
+          blink_state_feedback(currentDoorOpen);
+          publish_door_state(currentDoorOpen, "CHANGE");
         }
       }
 
@@ -211,7 +371,8 @@ void run() {
         if (sampledDoorOpen != currentDoorOpen) {
           currentDoorOpen = sampledDoorOpen;
           print_door_state(currentDoorOpen);
-          publish_door_state(currentDoorOpen);
+          blink_state_feedback(currentDoorOpen);
+          publish_door_state(currentDoorOpen, "CHANGE");
         }
       }
 
@@ -219,7 +380,7 @@ void run() {
     }
   }
 
-  enter_deep_sleep_for_next_change();
+  enter_deep_sleep_for_next_change(currentDoorOpen);
 }
 
 }  // namespace app

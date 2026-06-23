@@ -23,7 +23,7 @@ namespace app {
   static int64_t s_lastPushNotificationMs = 0;
   static int64_t s_doorOpenSinceMs = 0;
   static int64_t s_lastDoorPacketMs = 0;
-  static const int64_t kDoorStateTimeoutMs = 90000;
+  static const int64_t kDoorStateTimeoutMs = 45000;
 
   static void on_esp_now_receive(const uint8_t *fromMac, const uint8_t *data, size_t len) {
     if (fromMac == nullptr || data == nullptr || len == 0) {
