@@ -317,14 +317,16 @@ void init(const Config &config) {
     const uint32_t batteryThreshold = static_cast<uint32_t>(
         (kBatteryTxIntervalMs + timerIntervalMs - 1) / timerIntervalMs);
     ++s_batteryTxWakeCount;
+    ESP_LOGI(TAG, "Battery TX counter: %u / %u", s_batteryTxWakeCount, batteryThreshold);
     if (s_batteryTxWakeCount >= batteryThreshold) {
       s_batteryTxWakeCount = 0;  // Reset before spawning; RTC is clean before sleep
       // Clear volt idle bit BEFORE spawning so the pre-sleep wait always sees
       // the task as pending if it was created.
+      ESP_LOGI(TAG, "Battery TX: spawning voltage_task (wake count reached threshold %u)", batteryThreshold);
       if (s_ledEvents != nullptr) {
         xEventGroupClearBits(s_ledEvents, kVoltIdleBit);
       }
-      xTaskCreate(voltage_task, "volt_task", 2048, nullptr, 2, nullptr);
+      xTaskCreate(voltage_task, "volt_task", 4096, nullptr, 2, nullptr);
     }
   }
 }
