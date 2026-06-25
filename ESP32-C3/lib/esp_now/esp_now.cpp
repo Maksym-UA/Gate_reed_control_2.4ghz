@@ -19,26 +19,26 @@ namespace espnow {
 
   /// @brief Ensure that NVS is initialized, as it's required for Wi-Fi and ESP-NOW.
   static void ensure_nvs() {
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    esp_err_t return_value = nvs_flash_init();
+    if (return_value == ESP_ERR_NVS_NO_FREE_PAGES || return_value == ESP_ERR_NVS_NEW_VERSION_FOUND) {
       ESP_ERROR_CHECK(nvs_flash_erase());
-      ret = nvs_flash_init();
+      return_value = nvs_flash_init();
     }
-    if (ret != ESP_OK && ret != ESP_ERR_NVS_NOT_INITIALIZED) {
-      ESP_ERROR_CHECK(ret);
+    if (return_value != ESP_OK && return_value != ESP_ERR_NVS_NOT_INITIALIZED) {
+      ESP_ERROR_CHECK(return_value);
     }
 }
 
 /// @brief Ensure that Wi-Fi is started, as it's required for ESP-NOW.
 static void ensure_wifi_started(uint8_t channel) {
-  esp_err_t ret = esp_netif_init();
-  if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-    ESP_ERROR_CHECK(ret);
+  esp_err_t return_value = esp_netif_init();
+  if (return_value != ESP_OK && return_value != ESP_ERR_INVALID_STATE) {
+    ESP_ERROR_CHECK(return_value);
   }
 
-  ret = esp_event_loop_create_default();
-  if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-    ESP_ERROR_CHECK(ret);
+  return_value = esp_event_loop_create_default();
+  if (return_value != ESP_OK && return_value != ESP_ERR_INVALID_STATE) {
+    ESP_ERROR_CHECK(return_value);
   }
 
   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
@@ -71,6 +71,7 @@ static void on_recv(const esp_now_recv_info_t *recvInfo, const uint8_t *data, in
     return;
   }
 
+// Log the source MAC address and length of the received data, then call the user-defined receive callback if set.
   ESP_LOGI(
       TAG,
       "recv from %02X:%02X:%02X:%02X:%02X:%02X len=%d",
@@ -108,6 +109,7 @@ esp_err_t init(uint8_t channel) {
   return ESP_OK;
 }
 
+// @brief Send data to the broadcast address (FF:FF:FF:FF:FF:FF).
 esp_err_t send_broadcast(const uint8_t *data, size_t len) {
   if (!s_initialized) {
     return ESP_ERR_INVALID_STATE;

@@ -5,9 +5,6 @@
         },
         {
             "path": "ESP32-S3"
-        },
-        {
-            "path": "."
         }
     ],
     "settings": {

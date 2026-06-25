@@ -21,7 +21,7 @@ Each firmware keeps `src/main.cpp` minimal and places runtime logic in `src/appl
 ### Wiring Notes
 
 - Use an external 100k pull-up resistor on ESP32-C3 GPIO4 for the reed input line for more efficient power management.
-- Add an MTS-101 switch on the TP4056 Type-C battery path so battery power can be disconnected while the ESP32-C3 is powered from USB.
+- Add an MTS-101 switch on the battery path so battery power can be disconnected while the ESP32-C3 is powered from USB.
 
 ## Communication Model
 
@@ -29,6 +29,7 @@ ESP32-C3 publishes gate state messages:
 
 - `DOOR:OPEN`
 - `DOOR:CLOSED`
+- `BATT:X.XXV` (periodic battery voltage, e.g. `BATT:3.92V`)
 
 ESP32-S3 listens on ESP-NOW, updates remote door state, and marks state as stale if no packet arrives for a timeout window.
 
@@ -56,12 +57,14 @@ pio device monitor -b 115200
 
 ESP32-C3:
 
-1. Initializes ESP-NOW, reed input, and LED.
-2. Reads current door state and transmits initial state.
-3. Blinks LED 3 times when state is OPEN.
-4. Waits in boot grace window to allow monitoring/flashing.
-5. On wake from GPIO/timer, stays active briefly to catch quick follow-up transitions.
-6. Enters deep sleep, wakes on reed pin level change, and also uses a timer fallback wake.
+1. Initializes ESP-NOW, reed input, LED, and ADC voltage divider.
+2. Reads current door state and transmits initial state (`BOOT` TX kind on first cold boot).
+3. Blinks LED 3 times for OPEN, 1 time for CLOSED on state change.
+4. On timer wake with unchanged state, transmits `KEEPALIVE` once the periodic keep-alive threshold is reached.
+5. On timer wake, spawns a one-shot voltage task that reads the battery ADC and broadcasts `BATT:X.XXV` when the battery TX interval threshold is reached.
+6. Waits in boot grace window (15 s) on cold boot to allow monitoring/flashing.
+7. On wake from GPIO/timer, stays active briefly (3.5 s) to catch quick follow-up transitions.
+8. Enters deep sleep; wakes on reed pin level change (GPIO wakeup) with a timer fallback wake.
 
 ESP32-S3:
 
@@ -82,6 +85,7 @@ ESP32-C3/
     esp_now/
     led/
     reed/
+    voltage/
   src/
     application.cpp
     main.cpp
@@ -112,6 +116,7 @@ src/
 - Deep sleep on ESP32-C3 may make USB serial disappear until the next wake/reset.
 - If VS Code shows stale Problems after successful builds, run a clean build and reload the window.
 - KiCAd Xiao ESP32-C3 footprint from https://github.com/VectorSpaceHQ/XIAO_ESP32C3
+- Seeed Xiao ESP32-C3 Wiki https://wiki.seeedstudio.com/XIAO_ESP32C3_Getting_Started
 
 ## Contact
 

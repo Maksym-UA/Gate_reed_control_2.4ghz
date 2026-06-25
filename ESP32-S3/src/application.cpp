@@ -17,7 +17,10 @@ namespace app {
   static bool s_remoteDoorStateKnown = false;
   static bool s_remoteDoorOpen = false;
   static int64_t s_doorOpenStateDurationMs = 0;
-  static portMUX_TYPE s_stateMux = portMUX_INITIALIZER_UNLOCKED;
+  //portMUX_TYPE spinlock is a low-level, non-blocking lock. When a core tries to acquire
+  // a spinlock that is already held, it busy-waits — it loops continuously checking the lock
+  // until it becomes available, without ever yielding to the scheduler.
+  static portMUX_TYPE s_stateMux = portMUX_INITIALIZER_UNLOCKED; // Protects access to shared state variables
   static int64_t s_lastHeartbeatMs = 0;
   static const int64_t kHeartbeatIntervalMs = 10000;
   static int64_t s_lastPushNotificationMs = 0;
@@ -32,7 +35,7 @@ namespace app {
 
     if (len == 9 && memcmp(data, "DOOR:OPEN", 9) == 0) {
       const int64_t nowMs = esp_timer_get_time() / 1000;
-      taskENTER_CRITICAL(&s_stateMux);
+      taskENTER_CRITICAL(&s_stateMux);// Critical section to protect shared state
       bool wasAlreadyOpen = s_remoteDoorOpen;
       s_remoteDoorOpen = true;
       s_remoteDoorStateKnown = true;

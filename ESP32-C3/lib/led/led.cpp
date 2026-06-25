@@ -4,6 +4,7 @@
 
 namespace led {
 
+
   static gpio_num_t s_pin = GPIO_NUM_NC;
   static bool s_is_on = false;
 

@@ -13,6 +13,7 @@ static adc_cali_handle_t s_caliHandle = nullptr;
 static const adc_channel_t kNoChannel = static_cast<adc_channel_t>(-1);
 static adc_channel_t s_channel = kNoChannel;
 
+
 void init(gpio_num_t pin) {
     // ESP32-C3: GPIO0-GPIO4 map to ADC1 channels 0-4
     if (pin < GPIO_NUM_0 || pin > GPIO_NUM_4) {
@@ -58,7 +59,9 @@ void init(gpio_num_t pin) {
         .atten = ADC_ATTEN_DB_12,
         .bitwidth = ADC_BITWIDTH_DEFAULT,
     };
+
     const esp_err_t caliRet = adc_cali_create_scheme_curve_fitting(&caliCfg, &s_caliHandle);
+
     if (caliRet != ESP_OK) {
         ESP_LOGW(TAG, "ADC calibration unavailable (%s); using linear fallback", esp_err_to_name(caliRet));
         s_caliHandle = nullptr;
@@ -85,10 +88,11 @@ float read_voltage() {
     const int avgRaw = static_cast<int>(sum / kSamples);
 
     int millivolts = 0;
+
     if (s_caliHandle != nullptr) {
         const esp_err_t caliReadRet = adc_cali_raw_to_voltage(s_caliHandle, avgRaw, &millivolts);
         if (caliReadRet != ESP_OK) {
-            ESP_LOGW(TAG, "adc_cali_raw_to_voltage failed: %s", esp_err_to_name(caliReadRet));
+            ESP_LOGW(TAG, "adc_calib_raw_to_voltage failed: %s", esp_err_to_name(caliReadRet));
             millivolts = (avgRaw * 3100) / 4095;
         }
     } else {
