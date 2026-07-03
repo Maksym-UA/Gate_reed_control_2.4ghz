@@ -11,6 +11,11 @@ Dual-board ESP32 project for gate door-state telemetry over ESP-NOW.
 
 Each firmware keeps `src/main.cpp` minimal and places runtime logic in `src/application.cpp`.
 
+## Demo
+
+![Setup photo](https://drive.google.com/file/d/1qxfk7runnA6HooCKITNwfTbe6DSZwWtn/view)
+[Video walkthrough](https://drive.google.com/file/d/1xBrTgcdc16AM0VYVUGeMaC79JifpsuX4/view)
+
 ## Hardware
 
 | Board | Role | Key GPIO |
@@ -351,7 +356,6 @@ Gate_reed_control_2.4ghz.code-workspace
 .gitignore
 README.md
 src/
-
 ```
 
 ## Notes
