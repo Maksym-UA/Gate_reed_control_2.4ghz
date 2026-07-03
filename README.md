@@ -13,8 +13,9 @@ Each firmware keeps `src/main.cpp` minimal and places runtime logic in `src/appl
 
 ## Demo
 
-![Setup photo](https://drive.google.com/file/d/1qxfk7runnA6HooCKITNwfTbe6DSZwWtn/view)
-[Video walkthrough](https://drive.google.com/file/d/1xBrTgcdc16AM0VYVUGeMaC79JifpsuX4/view)
+[![Watch the demo](Media/Gate_reed.jpg)](Media/Reed_operation.mp4)
+
+[Video walkthrough](Media/Reed_operation.mp4)
 
 ## Hardware
 
