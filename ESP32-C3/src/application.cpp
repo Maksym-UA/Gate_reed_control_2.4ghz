@@ -349,7 +349,7 @@ namespace app {
     bool currentDoorOpen = reed::is_door_open();
 
     if (s_wakeCause != ESP_SLEEP_WAKEUP_GPIO && s_wakeCause != ESP_SLEEP_WAKEUP_TIMER) {
-      ESP_LOGI(TAG, "Boot grace %d ms before deep sleep", kBootUsbGraceMs);
+      ESP_LOGI(TAG, "Boot grace %d ms before deep sleep", kBootUsb(533) gate_reed: S3 receiver readyGraceMs);
 
       const int64_t graceStartMs = esp_timer_get_time() / 1000;
       while ((esp_timer_get_time() / 1000 - graceStartMs) < kBootUsbGraceMs) {
