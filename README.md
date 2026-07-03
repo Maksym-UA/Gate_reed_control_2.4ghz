@@ -13,9 +13,11 @@ Each firmware keeps `src/main.cpp` minimal and places runtime logic in `src/appl
 
 ## Demo
 
-[![Watch the demo](Media/Gate_reed.jpg)](Media/Reed_operation.mp4)
+[![Watch the demo](Media/Gate_reed.jpg)](https://github.com/Maksym-UA/Gate_reed_control_2.4ghz/releases/download/v1.0.1/Reed_operation.mp4)
 
-[Video walkthrough](Media/Reed_operation.mp4)
+[Video walkthrough](https://github.com/Maksym-UA/Gate_reed_control_2.4ghz/releases/download/v1.0.1/Reed_operation.mp4)
+
+_Fallback (repo file): [Media/Reed_operation.mp4](Media/Reed_operation.mp4)_
 
 ## Hardware
 
