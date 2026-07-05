@@ -4,6 +4,7 @@
 #include <string.h>
 #include <stdlib.h>
 
+#include "cJSON.h"
 #include "esp_crt_bundle.h"
 #include "esp_event.h"
 #include "esp_http_client.h"
@@ -90,6 +91,8 @@ esp_err_t telegram_init(void)
 
     if (bits & WIFI_CONNECTED_BIT) {
         ESP_LOGI(TAG, "Connected to AP: %s", WIFI_SSID);
+        // S3 is mains-powered — disable modem sleep to reduce post-longpoll TX latency.
+        esp_wifi_set_ps(WIFI_PS_NONE);
         return ESP_OK;
     }
 
@@ -132,7 +135,7 @@ static esp_err_t telegram_http_post_json(const char *url, const char *body)
     config.url = url;
     config.event_handler = http_event_handler;
     config.crt_bundle_attach = esp_crt_bundle_attach;
-    config.timeout_ms = 10000;
+    config.timeout_ms = 20000;
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (client == nullptr) {
@@ -196,12 +199,16 @@ esp_err_t telegram_send_message(const char *text)
     static const char url[] =
         "https://api.telegram.org/bot" TG_BOT_TOKEN "/sendMessage";
 
-    static char body[768];
-    snprintf(body, sizeof(body),
-             "{\"chat_id\":\"%s\",\"text\":\"%s\"}",
-             TG_CHAT_ID, text);
+    cJSON *obj = cJSON_CreateObject();
+    cJSON_AddStringToObject(obj, "chat_id", TG_CHAT_ID);
+    cJSON_AddStringToObject(obj, "text",    text);
+    char *body = cJSON_PrintUnformatted(obj);
+    cJSON_Delete(obj);
+    if (!body) return ESP_ERR_NO_MEM;
 
-    return telegram_http_post_json(url, body);
+    esp_err_t err = telegram_http_post_json(url, body);
+    cJSON_free(body);
+    return err;
 }
 
 esp_err_t telegram_send_admin_menu(void)
@@ -209,7 +216,7 @@ esp_err_t telegram_send_admin_menu(void)
     static const char url[] =
         "https://api.telegram.org/bot" TG_BOT_TOKEN "/sendMessage";
 
-    char body[768];
+    static char body[768];
     snprintf(body, sizeof(body),
              "{\"chat_id\":\"%s\","
              "\"text\":\"Admin menu\","
@@ -229,7 +236,7 @@ static esp_err_t telegram_answer_callback(const char *callback_query_id, const c
     static const char url[] =
         "https://api.telegram.org/bot" TG_BOT_TOKEN "/answerCallbackQuery";
 
-    char body[512];
+    static char body[512];
     snprintf(body, sizeof(body),
              "{\"callback_query_id\":\"%s\",\"text\":\"%s\"}",
              callback_query_id, text);
@@ -255,66 +262,6 @@ esp_err_t telegram_ack_callback(const char *callback_query_id, bool is_admin)
                                     is_admin ? "Reading saved voltage..." : "Unauthorized");
 }
 
-/* ── Minimal JSON extraction helpers ──────────────────────────────────────── */
-
-static bool json_extract_string_after(const char *start, const char *key,
-                                      char *out, size_t out_size)
-{
-    const char *p = strstr(start, key);
-    if (!p) {
-        return false;
-    }
-
-    p = strchr(p, ':');
-    if (!p) {
-        return false;
-    }
-    p++;
-
-    while (*p == ' ' || *p == '\"') {
-        if (*p == '\"') {
-            p++;
-            break;
-        }
-        p++;
-    }
-
-    const char *end = strchr(p, '\"');
-    if (!end) {
-        return false;
-    }
-
-    size_t len = (size_t)(end - p);
-    if (len >= out_size) {
-        len = out_size - 1;
-    }
-
-    memcpy(out, p, len);
-    out[len] = '\0';
-    return true;
-}
-
-static bool json_extract_int64_after(const char *start, const char *key, int64_t *value)
-{
-    const char *p = strstr(start, key);
-    if (!p) {
-        return false;
-    }
-
-    p = strchr(p, ':');
-    if (!p) {
-        return false;
-    }
-    p++;
-
-    while (*p == ' ') {
-        p++;
-    }
-
-    *value = strtoll(p, nullptr, 10);
-    return true;
-}
-
 /* ── Update parsing ───────────────────────────────────────────────────────── */
 
 esp_err_t telegram_poll_updates(telegram_command_result_t *result)
@@ -338,68 +285,67 @@ esp_err_t telegram_poll_updates(telegram_command_result_t *result)
         return err;
     }
 
-    if (strstr(s_httpResponse, "\"result\":[]") != nullptr) {
+    cJSON *root = cJSON_ParseWithLength(s_httpResponse, (size_t)s_httpResponseLen);
+    if (!root) {
+        ESP_LOGW(TAG, "cJSON parse failed");
         return ESP_OK;
     }
 
-    int64_t update_id = 0;
-    if (json_extract_int64_after(s_httpResponse, "\"update_id\"", &update_id)) {
-        s_lastUpdateId = update_id;
+    cJSON *result_arr = cJSON_GetObjectItemCaseSensitive(root, "result");
+    if (!cJSON_IsArray(result_arr) || cJSON_GetArraySize(result_arr) == 0) {
+        cJSON_Delete(root);
+        return ESP_OK;
     }
 
-    /* Handle /voltage command */
-    const char *message_block = strstr(s_httpResponse, "\"message\"");
-    if (message_block) {
-        char text[64] = {0};
-        int64_t from_id = 0;
+    // Process only the first update; advance offset so it is not returned again.
+    cJSON *update = cJSON_GetArrayItem(result_arr, 0);
+    cJSON *uid    = cJSON_GetObjectItemCaseSensitive(update, "update_id");
+    if (cJSON_IsNumber(uid)) {
+        s_lastUpdateId = (int64_t)uid->valuedouble;
+    }
 
-        bool has_text = json_extract_string_after(message_block, "\"text\"", text, sizeof(text));
-        const char *msg_from_block = strstr(message_block, "\"from\"");
-        bool has_from = msg_from_block &&
-                        json_extract_int64_after(msg_from_block, "\"id\"", &from_id);
+    // /voltage text command
+    cJSON *message = cJSON_GetObjectItemCaseSensitive(update, "message");
+    if (message) {
+        cJSON *text = cJSON_GetObjectItemCaseSensitive(message, "text");
+        cJSON *from = cJSON_GetObjectItemCaseSensitive(message, "from");
+        cJSON *fid  = from ? cJSON_GetObjectItemCaseSensitive(from, "id") : nullptr;
 
-        if (has_text && has_from && strcmp(text, "/voltage") == 0) {
-            result->has_request = true;
+        if (cJSON_IsString(text) && cJSON_IsNumber(fid) &&
+            strcmp(text->valuestring, "/voltage") == 0) {
+            result->has_request   = true;
             result->wants_voltage = true;
-            char from_buf[32];
-            snprintf(from_buf, sizeof(from_buf), "%lld", (long long)from_id);
-            result->is_admin = (strcmp(from_buf, TG_ADMIN_ID) == 0);
-            return ESP_OK;
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%.0f", fid->valuedouble);
+            result->is_admin = (strcmp(buf, TG_ADMIN_ID) == 0);
         }
     }
 
-    /* Handle inline button callback */
-    const char *callback_block = strstr(s_httpResponse, "\"callback_query\"");
-    if (callback_block) {
-        char callback_data[64] = {0};
-        char callback_query_id[128] = {0};
-        int64_t from_id = 0;
+    // CHECK_VOLTAGE inline button callback
+    cJSON *cb = cJSON_GetObjectItemCaseSensitive(update, "callback_query");
+    if (cb) {
+        cJSON *cb_id = cJSON_GetObjectItemCaseSensitive(cb, "id");
+        cJSON *data  = cJSON_GetObjectItemCaseSensitive(cb, "data");
+        cJSON *from  = cJSON_GetObjectItemCaseSensitive(cb, "from");
+        cJSON *fid   = from ? cJSON_GetObjectItemCaseSensitive(from, "id") : nullptr;
 
-        bool has_data = json_extract_string_after(callback_block, "\"data\"", callback_data, sizeof(callback_data));
-        bool has_cb_id = json_extract_string_after(callback_block, "\"id\"", callback_query_id, sizeof(callback_query_id));
-        const char *cb_from_block = strstr(callback_block, "\"from\"");
-        if (cb_from_block) {
-            json_extract_int64_after(cb_from_block, "\"id\"", &from_id);
-        }
-
-        if (has_data && strcmp(callback_data, "CHECK_VOLTAGE") == 0) {
-            result->has_request = true;
+        if (cJSON_IsString(data) && strcmp(data->valuestring, "CHECK_VOLTAGE") == 0) {
+            result->has_request   = true;
             result->wants_voltage = true;
 
-            char from_buf[32];
-            snprintf(from_buf, sizeof(from_buf), "%lld", (long long)from_id);
-            result->is_admin = (strcmp(from_buf, TG_ADMIN_ID) == 0);
-
-            // Store callback ID so the caller can ack it after this function returns,
-            // avoiding a nested HTTPS call inside telegram_poll_updates.
-            if (has_cb_id) {
-                strncpy(result->pending_callback_id, callback_query_id,
+            if (cJSON_IsNumber(fid)) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "%.0f", fid->valuedouble);
+                result->is_admin = (strcmp(buf, TG_ADMIN_ID) == 0);
+            }
+            if (cJSON_IsString(cb_id)) {
+                strncpy(result->pending_callback_id, cb_id->valuestring,
                         sizeof(result->pending_callback_id) - 1);
                 result->pending_callback_id[sizeof(result->pending_callback_id) - 1] = '\0';
             }
-            return ESP_OK;
         }
     }
 
+    cJSON_Delete(root);
     return ESP_OK;
 }

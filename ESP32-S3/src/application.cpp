@@ -8,6 +8,7 @@
 #include "esp_timer.h"
 #include "espnow_service.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 #include "telegram.h"
 
@@ -33,11 +34,60 @@ namespace app {
 
   static float s_lastBatteryVoltage = 0.0f;
   static bool s_hasBatteryVoltage = false;
-  static int64_t s_lastTelegramPollMs = 0;
-  static const int64_t kTelegramPollIntervalMs = 500; // long-poll blocks up to 25 s; 500 ms gap lets notifications fire
 
-  static void on_esp_now_receive(const uint8_t *fromMac, const uint8_t *data, size_t len) {
-    if (fromMac == nullptr || data == nullptr || len == 0) {
+  // Telegram task — message queue + task handle
+  static const size_t kTgMsgMaxLen = 160;
+  static QueueHandle_t s_tgQueue = nullptr;
+
+  // Enqueue a Telegram message from any task. Non-blocking; drops if queue full.
+  static void tg_enqueue(const char *text) {
+    if (s_tgQueue == nullptr) return;
+    char buf[kTgMsgMaxLen] = {};
+    strncpy(buf, text, kTgMsgMaxLen - 1);
+    if (xQueueSend(s_tgQueue, buf, 0) != pdTRUE) {
+      ESP_LOGW(TAG, "Telegram queue full, message dropped");
+    }
+  }
+
+  // Dedicated Telegram task: drains the outbound queue, then long-polls for commands.
+  // All HTTPS calls happen here, so the main task never blocks on network I/O.
+  static void tg_task(void *) {
+    char msg[kTgMsgMaxLen];
+    while (true) {
+      // Send all queued notifications before starting the next long-poll.
+      while (xQueueReceive(s_tgQueue, msg, 0) == pdTRUE) {
+        telegram_send_message(msg);
+      }
+
+      // Long-poll: blocks up to 25 s waiting for a Telegram update.
+      telegram_command_result_t cmd = {};
+      if (telegram_poll_updates(&cmd) == ESP_OK && cmd.has_request && cmd.wants_voltage) {
+        if (cmd.pending_callback_id[0] != '\0') {
+          telegram_ack_callback(cmd.pending_callback_id, cmd.is_admin);
+        }
+
+        float voltage = 0.0f;
+        bool hasVoltage = false;
+        taskENTER_CRITICAL(&s_stateMux);
+        voltage    = s_lastBatteryVoltage;
+        hasVoltage = s_hasBatteryVoltage;
+        taskEXIT_CRITICAL(&s_stateMux);
+
+        if (!cmd.is_admin) {
+          telegram_send_unauthorized_reply();
+        } else if (!hasVoltage) {
+          telegram_send_message("\xF0\x9F\x94\x8B No saved voltage yet");
+        } else {
+          telegram_send_voltage_reply(voltage);
+        }
+      }
+
+      // Brief yield so the scheduler can service the main task between poll cycles.
+      vTaskDelay(pdMS_TO_TICKS(50));
+    }
+  }
+
+  static void on_esp_now_receive(const uint8_t *fromMac, const uint8_t *data, size_t len) {    if (fromMac == nullptr || data == nullptr || len == 0) {
       return;
     }
 
@@ -111,6 +161,11 @@ namespace app {
       telegram_send_admin_menu();
     }
 
+    // Create Telegram queue and start the dedicated poll/send task.
+    // All HTTPS calls are serialised inside tg_task — main loop never blocks on network.
+    s_tgQueue = xQueueCreate(8, kTgMsgMaxLen);
+    xTaskCreate(tg_task, "tg_task", 10240, nullptr, 2, nullptr);
+
     s_lastHeartbeatMs = esp_timer_get_time() / 1000;
     ESP_LOGI(TAG, "S3 receiver ready");
   }
@@ -128,8 +183,6 @@ namespace app {
       int64_t lastDoorPacketMs = 0;
       int64_t doorOpenSinceMs = 0;
       int64_t lastPushNotificationMs = 0;
-      float lastBatteryVoltage = 0.0f;
-      bool hasBatteryVoltage = false;
 
       taskENTER_CRITICAL(&s_stateMux);
       remoteDoorStateKnown = s_remoteDoorStateKnown;
@@ -137,34 +190,15 @@ namespace app {
       lastDoorPacketMs = s_lastDoorPacketMs;
       doorOpenSinceMs = s_doorOpenSinceMs;
       lastPushNotificationMs = s_lastPushNotificationMs;
-      lastBatteryVoltage = s_lastBatteryVoltage;
-      hasBatteryVoltage = s_hasBatteryVoltage;
       taskEXIT_CRITICAL(&s_stateMux);
 
       if (s_notifyDoorOpened) {
         s_notifyDoorOpened = false;
-        telegram_send_message("\xF0\x9F\x9A\xAA Двері ВІДЧИНЕНІ");
+        tg_enqueue("\xF0\x9F\x9A\xAA Двері ВІДЧИНЕНІ");
       }
       if (s_notifyDoorClosed) {
         s_notifyDoorClosed = false;
-        telegram_send_message("\xE2\x9C\x85 Двері ЗАЧИНЕНІ");
-      }
-
-      if ((currentMillis - s_lastTelegramPollMs) >= kTelegramPollIntervalMs) {
-        s_lastTelegramPollMs = currentMillis;
-
-        telegram_command_result_t cmd = {};
-        if (telegram_poll_updates(&cmd) == ESP_OK && cmd.has_request && cmd.wants_voltage) {          // Ack the callback first (sequential, not nested inside poll)
-          if (cmd.pending_callback_id[0] != '\0') {
-            telegram_ack_callback(cmd.pending_callback_id, cmd.is_admin);
-          }          if (!cmd.is_admin) {
-            telegram_send_unauthorized_reply();
-          } else if (!hasBatteryVoltage) {
-            telegram_send_message("🔋 No saved voltage yet");
-          } else {
-            telegram_send_voltage_reply(lastBatteryVoltage);
-          }
-        }
+        tg_enqueue("\xE2\x9C\x85 Двері ЗАЧИНЕНІ");
       }
 
       const int64_t doorStateTimeoutMs = remoteDoorOpen ? kDoorStateTimeoutOpenMs : kDoorStateTimeoutClosedMs;
@@ -195,12 +229,12 @@ namespace app {
         s_doorOpenStateDurationMs = currentMillis - doorOpenSinceMs;
         const int64_t doorOpenMinutes = s_doorOpenStateDurationMs / 60000;
         const int64_t doorOpenSeconds = (s_doorOpenStateDurationMs % 60000) / 1000;
-        char msg[128];
+        char msg[kTgMsgMaxLen];
         snprintf(msg, sizeof(msg),
                  "\xE2\x9A\xA0 Двері все ще ВІДЧИНЕНІ: %lldхв %lldс. Закрийте двері!",
                  doorOpenMinutes, doorOpenSeconds);
         ESP_LOGI(TAG, "%s", msg);
-        telegram_send_message(msg);
+        tg_enqueue(msg);
       }
 
       vTaskDelay(pdMS_TO_TICKS(s_config.loopDelayMs));
