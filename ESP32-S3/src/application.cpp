@@ -1,6 +1,8 @@
 #include "application.h"
 
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -8,7 +10,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "telegram.h"
-
 
 namespace app {
 
@@ -18,22 +19,22 @@ namespace app {
   static bool s_remoteDoorStateKnown = false;
   static bool s_remoteDoorOpen = false;
   static int64_t s_doorOpenStateDurationMs = 0;
-  //portMUX_TYPE spinlock is a low-level, non-blocking lock. When a core tries to acquire
-  // a spinlock that is already held, it busy-waits — it loops continuously checking the lock
-  // until it becomes available, without ever yielding to the scheduler.
-  static portMUX_TYPE s_stateMux = portMUX_INITIALIZER_UNLOCKED; // Protects access to shared state variables
+  static portMUX_TYPE s_stateMux = portMUX_INITIALIZER_UNLOCKED;
   static int64_t s_lastHeartbeatMs = 0;
   static const int64_t kHeartbeatIntervalClosedMs = 5 * 60 * 1000;
   static const int64_t kHeartbeatIntervalOpenMs = 30000;
   static int64_t s_lastPushNotificationMs = 0;
   static int64_t s_doorOpenSinceMs = 0;
   static int64_t s_lastDoorPacketMs = 0;
-  static const int64_t kDoorStateTimeoutOpenMs   = 45000;         // fast C3 failure detection when open
-  static const int64_t kDoorStateTimeoutClosedMs = 6 * 60 * 1000; // > C3 5-min keepalive when closed
-  // Flags set inside the ESP-NOW callback and consumed in the run() loop.
-  // The run() loop is the only place where blocking Telegram HTTP calls are made.
+  static const int64_t kDoorStateTimeoutOpenMs   = 45000;
+  static const int64_t kDoorStateTimeoutClosedMs = 6 * 60 * 1000;
   static volatile bool s_notifyDoorOpened = false;
   static volatile bool s_notifyDoorClosed = false;
+
+  static float s_lastBatteryVoltage = 0.0f;
+  static bool s_hasBatteryVoltage = false;
+  static int64_t s_lastTelegramPollMs = 0;
+  static const int64_t kTelegramPollIntervalMs = 500; // long-poll blocks up to 25 s; 500 ms gap lets notifications fire
 
   static void on_esp_now_receive(const uint8_t *fromMac, const uint8_t *data, size_t len) {
     if (fromMac == nullptr || data == nullptr || len == 0) {
@@ -42,17 +43,15 @@ namespace app {
 
     if (len == 9 && memcmp(data, "DOOR:OPEN", 9) == 0) {
       const int64_t nowMs = esp_timer_get_time() / 1000;
-      taskENTER_CRITICAL(&s_stateMux);// Critical section to protect shared state
+      taskENTER_CRITICAL(&s_stateMux);
       bool wasAlreadyOpen = s_remoteDoorOpen;
       s_remoteDoorOpen = true;
       s_remoteDoorStateKnown = true;
-      // Always update lastDoorPacketMs to keep timeout window fresh
       s_lastDoorPacketMs = nowMs;
-      // Only reset open-duration baseline and push timer on state transition.
       if (!wasAlreadyOpen) {
         s_doorOpenSinceMs = nowMs;
         s_lastPushNotificationMs = nowMs;
-        s_notifyDoorOpened = true; // trigger Telegram notification from run() loop
+        s_notifyDoorOpened = true;
       }
       taskEXIT_CRITICAL(&s_stateMux);
       ESP_LOGI(TAG, "ESP-NOW RX: DOOR OPEN");
@@ -68,11 +67,28 @@ namespace app {
       s_lastDoorPacketMs = nowMs;
       s_doorOpenSinceMs = 0;
       if (wasOpen) {
-        s_notifyDoorClosed = true; // trigger Telegram notification from run() loop
+        s_notifyDoorClosed = true;
       }
       taskEXIT_CRITICAL(&s_stateMux);
       ESP_LOGI(TAG, "ESP-NOW RX: DOOR CLOSED");
       return;
+    }
+
+    if (len > 5 && memcmp(data, "BATT:", 5) == 0) {
+      char batt_buf[32] = {0};
+      size_t copy_len = len < sizeof(batt_buf) - 1 ? len : sizeof(batt_buf) - 1;
+      memcpy(batt_buf, data, copy_len);
+      batt_buf[copy_len] = '\0';
+
+      float voltage = 0.0f;
+      if (sscanf(batt_buf, "BATT:%fV", &voltage) == 1) {
+        taskENTER_CRITICAL(&s_stateMux);
+        s_lastBatteryVoltage = voltage;
+        s_hasBatteryVoltage = true;
+        taskEXIT_CRITICAL(&s_stateMux);
+        ESP_LOGI(TAG, "ESP-NOW RX: battery %.2f V", voltage);
+        return;
+      }
     }
 
     ESP_LOGI(TAG, "ESP-NOW RX: %.*s", static_cast<int>(len), reinterpret_cast<const char *>(data));
@@ -88,11 +104,11 @@ namespace app {
     ESP_ERROR_CHECK(espnow::init(1));
     espnow::set_receive_callback(on_esp_now_receive);
 
-    // Connect to WiFi AP for internet access (needed by Telegram).
-    // NOTE: ESP-NOW will use the AP's channel after connection — ensure the C3
-    // sender is configured to broadcast on the same channel.
     if (telegram_init() != ESP_OK) {
       ESP_LOGW(TAG, "Telegram init failed — notifications will be skipped");
+    } else {
+      telegram_send_message("🤖 Gate monitor online");
+      telegram_send_admin_menu();
     }
 
     s_lastHeartbeatMs = esp_timer_get_time() / 1000;
@@ -112,6 +128,8 @@ namespace app {
       int64_t lastDoorPacketMs = 0;
       int64_t doorOpenSinceMs = 0;
       int64_t lastPushNotificationMs = 0;
+      float lastBatteryVoltage = 0.0f;
+      bool hasBatteryVoltage = false;
 
       taskENTER_CRITICAL(&s_stateMux);
       remoteDoorStateKnown = s_remoteDoorStateKnown;
@@ -119,9 +137,10 @@ namespace app {
       lastDoorPacketMs = s_lastDoorPacketMs;
       doorOpenSinceMs = s_doorOpenSinceMs;
       lastPushNotificationMs = s_lastPushNotificationMs;
+      lastBatteryVoltage = s_lastBatteryVoltage;
+      hasBatteryVoltage = s_hasBatteryVoltage;
       taskEXIT_CRITICAL(&s_stateMux);
 
-      // Send state-change Telegram notifications (set in the ESP-NOW callback).
       if (s_notifyDoorOpened) {
         s_notifyDoorOpened = false;
         telegram_send_message("\xF0\x9F\x9A\xAA Двері ВІДЧИНЕНІ");
@@ -129,6 +148,23 @@ namespace app {
       if (s_notifyDoorClosed) {
         s_notifyDoorClosed = false;
         telegram_send_message("\xE2\x9C\x85 Двері ЗАЧИНЕНІ");
+      }
+
+      if ((currentMillis - s_lastTelegramPollMs) >= kTelegramPollIntervalMs) {
+        s_lastTelegramPollMs = currentMillis;
+
+        telegram_command_result_t cmd = {};
+        if (telegram_poll_updates(&cmd) == ESP_OK && cmd.has_request && cmd.wants_voltage) {          // Ack the callback first (sequential, not nested inside poll)
+          if (cmd.pending_callback_id[0] != '\0') {
+            telegram_ack_callback(cmd.pending_callback_id, cmd.is_admin);
+          }          if (!cmd.is_admin) {
+            telegram_send_unauthorized_reply();
+          } else if (!hasBatteryVoltage) {
+            telegram_send_message("🔋 No saved voltage yet");
+          } else {
+            telegram_send_voltage_reply(lastBatteryVoltage);
+          }
+        }
       }
 
       const int64_t doorStateTimeoutMs = remoteDoorOpen ? kDoorStateTimeoutOpenMs : kDoorStateTimeoutClosedMs;
@@ -146,11 +182,12 @@ namespace app {
       const int64_t heartbeatIntervalMs = remoteDoorOpen ? kHeartbeatIntervalOpenMs : kHeartbeatIntervalClosedMs;
       if ((currentMillis - s_lastHeartbeatMs) >= heartbeatIntervalMs) {
         s_lastHeartbeatMs = currentMillis;
-        ESP_LOGI(TAG, "HEARTBEAT: ESP-NOW door=%s", remoteDoorStateKnown ? (remoteDoorOpen ? "OPEN" : "CLOSED") : "UNKNOWN");
+        ESP_LOGI(TAG, "HEARTBEAT: ESP-NOW door=%s",
+                 remoteDoorStateKnown ? (remoteDoorOpen ? "OPEN" : "CLOSED") : "UNKNOWN");
       }
 
-      // Push notification is sent once the door is open as long as pushNotificationIntervalMs
-      if (remoteDoorStateKnown && remoteDoorOpen && (currentMillis - lastPushNotificationMs) >= s_config.pushNotificationIntervalMs) {
+      if (remoteDoorStateKnown && remoteDoorOpen &&
+          (currentMillis - lastPushNotificationMs) >= s_config.pushNotificationIntervalMs) {
         taskENTER_CRITICAL(&s_stateMux);
         s_lastPushNotificationMs = currentMillis;
         taskEXIT_CRITICAL(&s_stateMux);

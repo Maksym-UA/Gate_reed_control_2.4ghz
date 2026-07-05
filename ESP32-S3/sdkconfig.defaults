@@ -1,3 +1,6 @@
 # FreeRTOS task introspection (enables vTaskList / vTaskGetRunTimeStats)
 CONFIG_FREERTOS_USE_TRACE_FACILITY=y
 CONFIG_FREERTOS_USE_STATS_FORMATTING_FUNCTIONS=y
+
+# Main task stack — must be large enough for back-to-back TLS/HTTPS calls
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=12288

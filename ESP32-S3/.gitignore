@@ -4,3 +4,4 @@
 .vscode/launch.json
 .vscode/ipch
 Gate_reed_control_2.4ghz/
+lib/esp_now/telegram/secrets.h
