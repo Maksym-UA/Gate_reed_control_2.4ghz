@@ -216,19 +216,24 @@ esp_err_t telegram_send_admin_menu(void)
     static const char url[] =
         "https://api.telegram.org/bot" TG_BOT_TOKEN "/sendMessage";
 
-    static char body[768];
-    snprintf(body, sizeof(body),
-             "{\"chat_id\":\"%s\","
-             "\"text\":\"Admin menu\","
-             "\"reply_markup\":{"
-                 "\"inline_keyboard\":[["
-                     "{\"text\":\"Check voltage\",\"callback_data\":\"CHECK_VOLTAGE\"}"
-                 "]]"
-             "}"
-             "}",
-             TG_CHAT_ID);
+    cJSON *btn = cJSON_CreateObject();
+    cJSON_AddStringToObject(btn, "text",          "Check voltage");
+    cJSON_AddStringToObject(btn, "callback_data", "CHECK_VOLTAGE");
+    cJSON *row     = cJSON_CreateArray();  cJSON_AddItemToArray(row, btn);
+    cJSON *kbd     = cJSON_CreateArray();  cJSON_AddItemToArray(kbd, row);
+    cJSON *markup  = cJSON_CreateObject(); cJSON_AddItemToObject(markup, "inline_keyboard", kbd);
+    cJSON *obj     = cJSON_CreateObject();
+    cJSON_AddStringToObject(obj, "chat_id", TG_CHAT_ID);
+    cJSON_AddStringToObject(obj, "text",    "Admin menu");
+    cJSON_AddItemToObject(obj, "reply_markup", markup);
 
-    return telegram_http_post_json(url, body);
+    char *body = cJSON_PrintUnformatted(obj);
+    cJSON_Delete(obj);
+    if (!body) return ESP_ERR_NO_MEM;
+
+    esp_err_t err = telegram_http_post_json(url, body);
+    cJSON_free(body);
+    return err;
 }
 
 static esp_err_t telegram_answer_callback(const char *callback_query_id, const char *text)
@@ -236,19 +241,36 @@ static esp_err_t telegram_answer_callback(const char *callback_query_id, const c
     static const char url[] =
         "https://api.telegram.org/bot" TG_BOT_TOKEN "/answerCallbackQuery";
 
-    static char body[512];
-    snprintf(body, sizeof(body),
-             "{\"callback_query_id\":\"%s\",\"text\":\"%s\"}",
-             callback_query_id, text);
+    cJSON *obj = cJSON_CreateObject();
+    cJSON_AddStringToObject(obj, "callback_query_id", callback_query_id);
+    cJSON_AddStringToObject(obj, "text",              text);
+    char *body = cJSON_PrintUnformatted(obj);
+    cJSON_Delete(obj);
+    if (!body) return ESP_ERR_NO_MEM;
 
-    return telegram_http_post_json(url, body);
+    esp_err_t err = telegram_http_post_json(url, body);
+    cJSON_free(body);
+    return err;
 }
 
 esp_err_t telegram_send_voltage_reply(float voltage)
 {
-    char msg[128];
-    snprintf(msg, sizeof(msg), "🔋 Saved voltage: %.2f V", voltage);
-    return telegram_send_message(msg);
+    static const char url[] =
+        "https://api.telegram.org/bot" TG_BOT_TOKEN "/sendMessage";
+
+    char text[48];
+    snprintf(text, sizeof(text), "\xF0\x9F\x94\x8B Saved voltage: %.2f V", voltage);
+
+    cJSON *obj = cJSON_CreateObject();
+    cJSON_AddStringToObject(obj, "chat_id", TG_CHAT_ID);
+    cJSON_AddStringToObject(obj, "text",    text);
+    char *body = cJSON_PrintUnformatted(obj);
+    cJSON_Delete(obj);
+    if (!body) return ESP_ERR_NO_MEM;
+
+    esp_err_t err = telegram_http_post_json(url, body);
+    cJSON_free(body);
+    return err;
 }
 
 esp_err_t telegram_send_unauthorized_reply(void)
@@ -297,54 +319,62 @@ esp_err_t telegram_poll_updates(telegram_command_result_t *result)
         return ESP_OK;
     }
 
-    // Process only the first update; advance offset so it is not returned again.
-    cJSON *update = cJSON_GetArrayItem(result_arr, 0);
-    cJSON *uid    = cJSON_GetObjectItemCaseSensitive(update, "update_id");
-    if (cJSON_IsNumber(uid)) {
-        s_lastUpdateId = (int64_t)uid->valuedouble;
-    }
-
-    // /voltage text command
-    cJSON *message = cJSON_GetObjectItemCaseSensitive(update, "message");
-    if (message) {
-        cJSON *text = cJSON_GetObjectItemCaseSensitive(message, "text");
-        cJSON *from = cJSON_GetObjectItemCaseSensitive(message, "from");
-        cJSON *fid  = from ? cJSON_GetObjectItemCaseSensitive(from, "id") : nullptr;
-
-        if (cJSON_IsString(text) && cJSON_IsNumber(fid) &&
-            strcmp(text->valuestring, "/voltage") == 0) {
-            result->has_request   = true;
-            result->wants_voltage = true;
-            char buf[32];
-            snprintf(buf, sizeof(buf), "%.0f", fid->valuedouble);
-            result->is_admin = (strcmp(buf, TG_ADMIN_ID) == 0);
+    // Iterate every update so the offset advances past all of them.
+    // The first actionable command is returned; later ones in the same batch
+    // are consumed (no pile-up) and will arrive on the very next poll since
+    // Telegram returns immediately when pending updates exist.
+    cJSON *update = nullptr;
+    cJSON_ArrayForEach(update, result_arr) {
+        // Always advance the offset, regardless of whether this update is handled.
+        cJSON *uid = cJSON_GetObjectItemCaseSensitive(update, "update_id");
+        if (cJSON_IsNumber(uid)) {
+            s_lastUpdateId = (int64_t)uid->valuedouble;
         }
-    }
 
-    // CHECK_VOLTAGE inline button callback
-    cJSON *cb = cJSON_GetObjectItemCaseSensitive(update, "callback_query");
-    if (cb) {
-        cJSON *cb_id = cJSON_GetObjectItemCaseSensitive(cb, "id");
-        cJSON *data  = cJSON_GetObjectItemCaseSensitive(cb, "data");
-        cJSON *from  = cJSON_GetObjectItemCaseSensitive(cb, "from");
-        cJSON *fid   = from ? cJSON_GetObjectItemCaseSensitive(from, "id") : nullptr;
+        if (result->has_request) continue; // first command already captured
 
-        if (cJSON_IsString(data) && strcmp(data->valuestring, "CHECK_VOLTAGE") == 0) {
-            result->has_request   = true;
-            result->wants_voltage = true;
+        // /voltage text command
+        cJSON *message = cJSON_GetObjectItemCaseSensitive(update, "message");
+        if (message) {
+            cJSON *text = cJSON_GetObjectItemCaseSensitive(message, "text");
+            cJSON *from = cJSON_GetObjectItemCaseSensitive(message, "from");
+            cJSON *fid  = from ? cJSON_GetObjectItemCaseSensitive(from, "id") : nullptr;
 
-            if (cJSON_IsNumber(fid)) {
+            if (cJSON_IsString(text) && cJSON_IsNumber(fid) &&
+                strcmp(text->valuestring, "/voltage") == 0) {
+                result->has_request   = true;
+                result->wants_voltage = true;
                 char buf[32];
                 snprintf(buf, sizeof(buf), "%.0f", fid->valuedouble);
                 result->is_admin = (strcmp(buf, TG_ADMIN_ID) == 0);
             }
-            if (cJSON_IsString(cb_id)) {
-                strncpy(result->pending_callback_id, cb_id->valuestring,
-                        sizeof(result->pending_callback_id) - 1);
-                result->pending_callback_id[sizeof(result->pending_callback_id) - 1] = '\0';
+        }
+
+        // CHECK_VOLTAGE inline button callback
+        cJSON *cb = cJSON_GetObjectItemCaseSensitive(update, "callback_query");
+        if (cb) {
+            cJSON *cb_id = cJSON_GetObjectItemCaseSensitive(cb, "id");
+            cJSON *data  = cJSON_GetObjectItemCaseSensitive(cb, "data");
+            cJSON *from  = cJSON_GetObjectItemCaseSensitive(cb, "from");
+            cJSON *fid   = from ? cJSON_GetObjectItemCaseSensitive(from, "id") : nullptr;
+
+            if (cJSON_IsString(data) && strcmp(data->valuestring, "CHECK_VOLTAGE") == 0) {
+                result->has_request   = true;
+                result->wants_voltage = true;
+
+                if (cJSON_IsNumber(fid)) {
+                    char buf[32];
+                    snprintf(buf, sizeof(buf), "%.0f", fid->valuedouble);
+                    result->is_admin = (strcmp(buf, TG_ADMIN_ID) == 0);
+                }
+                if (cJSON_IsString(cb_id)) {
+                    strncpy(result->pending_callback_id, cb_id->valuestring,
+                            sizeof(result->pending_callback_id) - 1);
+                    result->pending_callback_id[sizeof(result->pending_callback_id) - 1] = '\0';
+                }
             }
         }
-    }
+    } // end cJSON_ArrayForEach
 
     cJSON_Delete(root);
     return ESP_OK;
