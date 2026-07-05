@@ -20,11 +20,10 @@ namespace app {
   static const char *TAG = "gate_reed";
   static const int kBootUsbGraceMs = 15000;
   static const int64_t kFallbackWakeupIntervalMs = 3000;
-  static const int64_t kOpenStateWakeupIntervalMs = 5000;
-  static const int64_t kKeepAliveWakeupIntervalMs = 10000;
-  static const int64_t kPeriodicKeepAliveMs = 20000;
+  static const int64_t kOpenStateWakeupIntervalMs = 30000;
+  static const int64_t kKeepAliveWakeupIntervalMs = 5 * 60 * 1000; // 5 min when closed — GPIO wakeup handles state changes
+  static const int64_t kPeriodicKeepAliveMs = 30000;               // keepalive fires every timer wake in both states
   static const int kPostWakeActiveMs = 3500;
-  static const int64_t kBatteryTxIntervalMs = 10000;
 
 
   static const char *wakeup_cause_to_string(esp_sleep_wakeup_cause_t cause) {
@@ -56,7 +55,6 @@ namespace app {
   RTC_DATA_ATTR static bool s_lastPublishedDoorOpen = false; // RTC_DATA_ATTR retains value across deep sleep cycles
   RTC_DATA_ATTR static bool s_lastPublishedDoorOpenValid = false;
   RTC_DATA_ATTR static uint32_t s_unchangedTimerWakeCount = 0;
-  RTC_DATA_ATTR static uint32_t s_batteryTxWakeCount = 0;
 
   // LED blink command posted to s_ledQueue by the main task.
   struct LedCmd {
@@ -267,7 +265,7 @@ namespace app {
 
     voltage::init(s_config.voltagePin);
 
-    ESP_ERROR_CHECK(espnow::init(1));
+    ESP_ERROR_CHECK(espnow::init(4));
 
     reed::init(s_config.sensorPin);
 
@@ -315,28 +313,13 @@ namespace app {
       ESP_LOGI(TAG, "Skipping boot TX (unchanged timer wake, keepalive not due)");
     }
 
-    // Battery TX: spawn a low-priority (2) one-shot task to read and broadcast
-    // voltage every ~kBatteryTxIntervalMs. The task runs without blocking the
-    // main sensor loop or LED feedback.
-    if (isTimerWake) {
-      const int64_t timerIntervalMs =
-          esp_sleep_is_valid_wakeup_gpio(s_config.sensorPin)
-              ? (currentDoorOpen ? kOpenStateWakeupIntervalMs : kKeepAliveWakeupIntervalMs)
-              : kFallbackWakeupIntervalMs;
-      const uint32_t batteryThreshold = static_cast<uint32_t>(
-          (kBatteryTxIntervalMs + timerIntervalMs - 1) / timerIntervalMs);
-      ++s_batteryTxWakeCount;
-      ESP_LOGI(TAG, "Battery TX counter: %u / %u", s_batteryTxWakeCount, batteryThreshold);
-      if (s_batteryTxWakeCount >= batteryThreshold) {
-        s_batteryTxWakeCount = 0;  // Reset before spawning; RTC is clean before sleep
-        // Clear volt idle bit BEFORE spawning so the pre-sleep wait always sees
-        // the task as pending if it was created.
-        ESP_LOGI(TAG, "Battery TX: spawning voltage_task (wake count reached threshold %u)", batteryThreshold);
-        if (s_ledEvents != nullptr) {
-          xEventGroupClearBits(s_ledEvents, kVoltIdleBit);
-        }
-        xTaskCreate(voltage_task, "volt_task", 4096, nullptr, 2, nullptr);
+    // Battery TX: measure and broadcast voltage once when the door first opens.
+    if (currentDoorOpen && stateChangedSinceLastPublish) {
+      ESP_LOGI(TAG, "Battery TX: door opened, spawning voltage_task");
+      if (s_ledEvents != nullptr) {
+        xEventGroupClearBits(s_ledEvents, kVoltIdleBit);
       }
+      xTaskCreate(voltage_task, "volt_task", 4096, nullptr, 2, nullptr);
     }
   }
 
@@ -349,7 +332,7 @@ namespace app {
     bool currentDoorOpen = reed::is_door_open();
 
     if (s_wakeCause != ESP_SLEEP_WAKEUP_GPIO && s_wakeCause != ESP_SLEEP_WAKEUP_TIMER) {
-      ESP_LOGI(TAG, "Boot grace %d ms before deep sleep", kBootUsb(533) gate_reed: S3 receiver readyGraceMs);
+      ESP_LOGI(TAG, "Boot grace %d ms before deep sleep", kBootUsbGraceMs);
 
       const int64_t graceStartMs = esp_timer_get_time() / 1000;
       while ((esp_timer_get_time() / 1000 - graceStartMs) < kBootUsbGraceMs) {

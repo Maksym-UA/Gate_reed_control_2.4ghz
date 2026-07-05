@@ -2,6 +2,10 @@ idf_component_register(
     SRCS
         "main.cpp"
         "application.cpp"
+        "../lib/esp_now/telegram/telegram.cpp"
+        "../lib/esp_now/esp_now.cpp"
     INCLUDE_DIRS
         "../include"
+        "../lib/esp_now"
+        "../lib/esp_now/telegram"
 )

@@ -45,6 +45,10 @@ namespace espnow {
         ESP_ERROR_CHECK(ret);
       }
 
+      // Must be created before esp_wifi_start() so the DHCP client is attached
+      // to the STA interface from the moment the driver comes up.
+      esp_netif_create_default_wifi_sta();
+
       wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
       ESP_ERROR_CHECK(esp_wifi_init(&cfg));
       ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
