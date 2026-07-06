@@ -21,7 +21,7 @@ namespace app {
   static const int kBootUsbGraceMs = 15000;
   static const int64_t kFallbackWakeupIntervalMs = 3000;
   static const int64_t kOpenStateWakeupIntervalMs = 30000;
-  static const int64_t kKeepAliveWakeupIntervalMs = 5 * 60 * 1000; // 5 min when closed — GPIO wakeup handles state changes
+  static const int64_t kKeepAliveWakeupIntervalMs = 60000;  // 1 min when closed — GPIO wakeup is the primary trigger; timer is fallback
   static const int64_t kPeriodicKeepAliveMs = 30000;               // keepalive fires every timer wake in both states
   static const int kPostWakeActiveMs = 3500;
 
@@ -186,9 +186,13 @@ namespace app {
               static_cast<int>(s_config.sensorPin));
     }
 
-    // Use the debounced logical state from the run loop for timer policy.
-    // A single raw sample taken right before sleep can be biased by wiring/leakage.
-    const bool doorOpenNow = currentDoorOpen;
+    // Use the debounced pre-sleep pin level for the timer policy.
+    // The pin is sampled twice with a debounce delay above, so it reflects the
+    // actual reed state at sleep time — more current than the run-loop's last
+    // snapshot, which can be stale if the door changed just before we slept.
+    // This also keeps the GPIO wakeup polarity (derived from level) and the
+    // timer interval consistent with each other.
+    const bool doorOpenNow = (level == 1);
     const int64_t timerWakeupIntervalMs = !wakePinValid
         ? kFallbackWakeupIntervalMs
         : (doorOpenNow ? kOpenStateWakeupIntervalMs : kKeepAliveWakeupIntervalMs);

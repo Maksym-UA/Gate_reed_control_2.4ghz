@@ -5,9 +5,9 @@
 Dual-board ESP32 project for gate door-state telemetry over ESP-NOW.
 
 - Xiao ESP32-C3 acts as the transmitter
-- ESP32-S3 acts as the receiver
+- ESP32-S3 acts as the receiver with Telegram bot push notifications
 - Framework: ESP-IDF via PlatformIO
-- Transport: ESP-NOW (2.4GHz)
+- Transport: ESP-NOW (2.4 GHz) + HTTPS (Telegram Bot API)
 
 Each firmware keeps `src/main.cpp` minimal and places runtime logic in `src/application.cpp`.
 
@@ -24,7 +24,7 @@ _Fallback (repo file): [Media/Reed_operation.mp4](Media/Reed_operation.mp4)_
 | Board | Role | Key GPIO |
 |---|---|---|
 | ESP32-C3 (Seeed XIAO ESP32C3) | Reed sensor reader + ESP-NOW TX + deep sleep | Reed: GPIO4, LED: GPIO20 |
-| ESP32-S3 (ESP32-S3-DevKitC-1) | ESP-NOW RX + state monitoring | No required sensor GPIO in current receiver build |
+| ESP32-S3 (ESP32-S3-DevKitC-1) | ESP-NOW RX + WiFi STA + Telegram bot | No sensor GPIO; WiFi used for Telegram HTTPS |
 
 ### Wiring Notes
 
@@ -61,6 +61,51 @@ pio run -t upload
 pio device monitor -b 115200
 ```
 
+## Telegram Bot Setup
+
+The ESP32-S3 connects to a Telegram bot to deliver door-state push notifications and respond to admin commands.
+
+### Credentials
+
+Credentials are stored in `ESP32-S3/lib/esp_now/telegram/secrets.h`, which is gitignored.
+
+1. Copy the template:
+   ```bash
+   cp ESP32-S3/lib/esp_now/telegram/secrets.h.template \
+      ESP32-S3/lib/esp_now/telegram/secrets.h
+   ```
+2. Fill in the values:
+   ```c
+   #define WIFI_SSID      "your_wifi_ssid"
+   #define WIFI_PASSWORD  "your_wifi_password"
+   #define TG_BOT_TOKEN   "123456:ABC-..."
+   #define TG_CHAT_ID     "123456789"   // chat to receive notifications
+   #define TG_ADMIN_ID    "123456789"   // user ID allowed to run admin commands
+   ```
+3. Create a bot with [@BotFather](https://t.me/BotFather) and copy the token.
+4. Retrieve your chat/user ID via [@userinfobot](https://t.me/userinfobot) or `getUpdates`.
+
+### Notifications
+
+| Event | Telegram message |
+|---|---|
+| Door opened | 🚪 Двері ВІДЧИНЕНІ |
+| Door closed | ✅ Двері ЗАЧИНЕНІ |
+| Door still open (every 5 min) | ⚠️ Двері все ще ВІДЧИНЕНІ: Xхв Yс |
+
+### Admin Commands
+
+| Command / Button | Response |
+|---|---|
+| `/voltage` text message | Battery voltage or "no data yet" |
+| `Check Voltage` inline button | Same as `/voltage` |
+
+Only `TG_ADMIN_ID` receives voltage data; all others get an unauthorized reply.
+
+### Transport
+
+The bot uses **long-polling** (`getUpdates` with `timeout=25`). No webhook or public IP is required. All HTTPS calls run inside a dedicated `tg_task` FreeRTOS task so the main door-state loop never blocks on network I/O.
+
 ## Runtime Flow
 
 ESP32-C3:
@@ -76,12 +121,13 @@ ESP32-C3:
 
 ESP32-S3:
 
-1. Initializes ESP-NOW in receiver mode.
-2. Receives `DOOR:OPEN` / `DOOR:CLOSED` packets.
-3. Tracks known/unknown remote door state.
-4. Logs periodic heartbeat with current state.
-5. Marks door state stale after timeout without packets.
-6. Emits periodic push notification logs while door remains OPEN.
+1. Initializes ESP-NOW, connects to WiFi, and starts the Telegram bot client.
+2. Receives `DOOR:OPEN` / `DOOR:CLOSED` / `BATT:X.XXV` packets via ESP-NOW.
+3. Tracks known/unknown remote door state; marks it stale after a timeout without packets.
+4. Enqueues Telegram notifications: door opened, door closed, and a repeat reminder every 5 minutes while the door remains open.
+5. Runs a dedicated `tg_task` (FreeRTOS) for all HTTPS operations — the main loop never blocks on network I/O.
+6. Long-polls Telegram (25 s server timeout) for admin commands: `/voltage` text message and `CHECK_VOLTAGE` inline button.
+7. Logs a periodic heartbeat with the current door state.
 
 ## System Architecture
 
@@ -116,7 +162,8 @@ ESP32-C3 transmitter:
 - ESP-NOW wireless interface
 
 ESP32-S3 receiver:
-- ESP-NOW wireless interface
+- ESP-NOW wireless interface (2.4 GHz)
+- WiFi STA (WPA2, used for Telegram HTTPS)
 - UART logging interface
 
 ### Layer Model
@@ -165,8 +212,10 @@ ESP32-C3:
 
 ESP32-S3:
 - ESP-NOW packet reception
+- WiFi STA connection (WPA2)
+- Telegram push notifications via HTTPS (`sendMessage`)
+- Telegram long-poll command handler (`/voltage`, `CHECK_VOLTAGE` inline button)
 - UART log output
-- State monitoring output
 
 #### Reliability Layer
 Improves robustness and fault tolerance.
@@ -243,6 +292,7 @@ flowchart LR
     subgraph RX["ESP32-S3 Receiver"]
         subgraph P2["Peripheral Layer"]
             ESPNOW2["ESP-NOW Init"]
+            WIFI["WiFi STA Init"]
             UART["UART / Serial Log Init"]
         end
 
@@ -251,10 +301,13 @@ flowchart LR
             FSM2["Receiver State FSM"]
             STALE["Timeout / Stale Detection"]
             BATT2["Battery Status Update"]
+            TG_QUEUE["Telegram Queue"]
+            TG_TASK["tg_task\n(FreeRTOS)"]
         end
 
         subgraph O2["Transport / Output Layer"]
             LOG["UART Logs / Monitoring"]
+            TG["Telegram Bot API\n(HTTPS long-poll + POST)"]
         end
 
         subgraph R2["Reliability Layer"]
@@ -262,10 +315,14 @@ flowchart LR
         end
 
         ESPNOW2 --> PARSE
+        WIFI --> TG_TASK
         PARSE --> FSM2
         PARSE --> BATT2
-        FSM2 --> LOG
+        FSM2 --> TG_QUEUE
         BATT2 --> LOG
+        TG_QUEUE --> TG_TASK
+        TG_TASK --> TG
+        FSM2 --> LOG
         STALE --> FSM2
         REC --> STALE
         UART --> LOG
@@ -312,11 +369,17 @@ stateDiagram-v2
     PARSE_PACKET --> STATE_CLOSED : DOOR:CLOSED
     PARSE_PACKET --> UPDATE_BATTERY : BATT:X.XXV
 
-    STATE_OPEN --> LISTENING
-    STATE_CLOSED --> LISTENING
+    STATE_OPEN --> ENQUEUE_NOTIFY : state changed
+    STATE_OPEN --> LISTENING : keepalive (no change)
+    STATE_CLOSED --> ENQUEUE_NOTIFY : state changed
+    STATE_CLOSED --> LISTENING : keepalive (no change)
+    ENQUEUE_NOTIFY --> LISTENING
     UPDATE_BATTERY --> LISTENING
 
-    LISTENING --> STATE_STALE : timeout
+    LISTENING --> ENQUEUE_REMIND : door open ≥ 5 min
+    ENQUEUE_REMIND --> LISTENING
+
+    LISTENING --> STATE_STALE : packet timeout
     STATE_STALE --> LISTENING : next valid packet
 ```
 
@@ -349,6 +412,13 @@ ESP32-S3/
     application.h
   lib/
     esp_now/
+      esp_now.cpp
+      espnow_service.h
+      telegram/
+        telegram.cpp
+        telegram.h
+        secrets.h          ← gitignored; copy from secrets.h.template
+        secrets.h.template
   src/
     application.cpp
     main.cpp
@@ -366,6 +436,7 @@ src/
 - ESP-NOW is connectionless and best-effort; RF environment affects reliability.
 - Deep sleep on ESP32-C3 may make USB serial disappear until the next wake/reset.
 - If VS Code shows stale Problems after successful builds, run a clean build and reload the window.
+- `ESP32-S3/lib/esp_now/telegram/secrets.h` is gitignored. Copy `secrets.h.template` to `secrets.h` and fill in your credentials before building the S3 firmware.
 - KiCAd Xiao ESP32-C3 footprint from https://github.com/VectorSpaceHQ/XIAO_ESP32C3
 - Seeed Xiao ESP32-C3 Wiki https://wiki.seeedstudio.com/XIAO_ESP32C3_Getting_Started
 
