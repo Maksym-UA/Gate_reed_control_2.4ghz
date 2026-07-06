@@ -1,4 +1,4 @@
-# Gate Reed Control 2.4GHz
+# Gate Reed Control 2.4GHz & Telegram Bot
 
 ## Overview
 
